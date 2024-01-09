@@ -196,6 +196,7 @@ pub struct RequestReward<'info> {
 pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
     let contributor = &mut ctx.accounts.contributor;
 
+    msg!("Attempting to request reward for contributor: {}", contributor.reward_address);
     // Convert i64 Unix timestamp to u64
     let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
 
@@ -216,10 +217,12 @@ pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
         let contributor_address_str = contributor.reward_address.to_string();
         let state = &mut ctx.accounts.oracle_contract_state;
         state.pending_payments.remove(&contributor_address_str);
+
+        msg!("Reward Request: Contributor: {}, Amount: {}", contributor.reward_address, reward_amount);
+
     } else {
         return Err(OracleError::NotEligibleForReward.into());
     }
-
     Ok(())
 }
 
@@ -238,27 +241,33 @@ pub struct RegisterNewDataContributor<'info> {
 
 pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContributor>) -> Result<()> {
     let state = &mut ctx.accounts.oracle_contract_state;
+    msg!("Initiating new contributor registration: {}", ctx.accounts.contributor_account.key());
 
     // Check if the contributor is already registered
     if state.contributors.iter().any(|c| c.reward_address == *ctx.accounts.contributor_account.key) {
+        msg!("Registration failed: Contributor already registered: {}", ctx.accounts.contributor_account.key);
         return Err(OracleError::ContributorAlreadyRegistered.into());
     }
 
+    msg!("Checking registration fee payment for new contributor: {}", ctx.accounts.contributor_account.key);
     // Check if the fee_receiving_contract_account received the registration fee
     if ctx.accounts.fee_receiving_contract_account.to_account_info().lamports() < REGISTRATION_ENTRANCE_FEE_SOL {
         return Err(OracleError::RegistrationFeeNotPaid.into());
     }
 
+    msg!("Registration fee verified. Attempting to registering new contributor {}", ctx.accounts.contributor_account.key);
+
     // Transfer the fee to the reward pool account
     **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() += ctx.accounts.fee_receiving_contract_account.to_account_info().lamports();
     **ctx.accounts.fee_receiving_contract_account.to_account_info().lamports.borrow_mut() = 0;
 
+    let last_active_timestamp = Clock::get()?.unix_timestamp as u64;
     // Create and add the new contributor
     let new_contributor = Contributor {
         reward_address: *ctx.accounts.contributor_account.key,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
         compliance_score: 0, // Initial compliance score
-        last_active_timestamp: Clock::get()?.unix_timestamp as u64, // Set the last active timestamp to the current time
+        last_active_timestamp: last_active_timestamp, // Set the last active timestamp to the current time
         total_reports_submitted: 0, // Initially, no reports have been submitted
         accurate_reports_count: 0, // Initially, no accurate reports
         current_streak: 0, // No streak at the beginning
@@ -274,8 +283,7 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     state.contributors.push(new_contributor);
 
     // Logging for debug purposes
-    msg!("New Contributor Registered: {:?}", ctx.accounts.contributor_account.key);
-
+    msg!("New Contributor successfully Registered: Address: {}, Timestamp: {}", ctx.accounts.contributor_account.key, last_active_timestamp);
     Ok(())
 }
 
@@ -328,6 +336,8 @@ pub fn update_activity_and_compliance_helper(
     contributor.is_reliable = contributor.total_reports_submitted != 0 && (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32) >= 0.8;
     contributor.is_eligible_for_rewards = contributor.total_reports_submitted >= MIN_REPORTS_FOR_REWARD && contributor.is_reliable;
 
+    msg!("Contributor {} updated: Last Active Timestamp: {}, Total Reports Submitted: {}, Accurate Reports Count: {}, Current Streak: {}, Compliance Score: {}, Reliability Score: {}, Consensus Failures: {}, Ban Expiry: {}, Is Recently Active: {}, Is Reliable: {}, Is Eligible For Rewards: {}", contributor.reward_address, contributor.last_active_timestamp, contributor.total_reports_submitted, contributor.accurate_reports_count, contributor.current_streak, contributor.compliance_score, contributor.reliability_score, contributor.consensus_failures, contributor.ban_expiry, contributor.is_recently_active, contributor.is_reliable, contributor.is_eligible_for_rewards);
+
     Ok(())
 
 }
@@ -367,9 +377,11 @@ pub fn add_txid_for_monitoring_helper(
 
     // Verify that the caller is the bridge contract
     if ctx.accounts.caller.key != &state.bridge_contract_pubkey {
+        msg!("Add TXID Authorization failed: Invalid caller (not the Bridge Contract): {}", ctx.accounts.caller.key);
         return Err(OracleError::InvalidAccountData.into());
     }
 
+    msg!("The Pastel Solana Bridge contract is attempting to add a new Pastel TXID for monitoring: {}", data.txid);
     // Add the TXID to the monitored list and pending payments
     state.monitored_txids.push(txid.clone());
     state.pending_payments.insert(
@@ -380,8 +392,7 @@ pub fn add_txid_for_monitoring_helper(
             payment_status: PaymentStatus::Pending,
         },
     );
-
-    msg!("New TXID for Monitoring: {}", data.txid);
+    msg!("Successfully Added Pastel TXID for Monitoring: {}", data.txid);
     Ok(())
 }
 
@@ -450,6 +461,8 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, report: PastelT
     let contributor_key = ctx.accounts.contributor.key();
     let state = &mut ctx.accounts.oracle_contract_state;
 
+    msg!("Data Contributor node {} Attempting to submit a data report for TXID: {}", contributor_key, report.txid);
+
     // Check if the contributor is registered and not banned
     let contributor = state.contributors.iter().find(|c| c.reward_address == contributor_key);
     let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
@@ -462,9 +475,11 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, report: PastelT
     // Validate the report
     validate_data_contributor_report(&report)?;
 
+    msg!("Report from Data Contributor node {} is valid, now trying to add it to the OracleContractState", contributor_key);
     // Add or update the report in the OracleContractState
     state.add_or_update_report(report.clone(), Clock::get()?.unix_timestamp as u64)?;
 
+    msg!("Report from Data Contributor node {} successfully added to the OracleContractState", contributor_key);
     // Check if consensus should be calculated
     if should_calculate_consensus(state, &report.txid)? {
         calculate_consensus_and_cleanup(state, &report.txid)?;
@@ -521,18 +536,23 @@ fn calculate_consensus(
 
 
 fn calculate_consensus_and_cleanup(state: &mut OracleContractState, txid: &str) -> Result<()> {
+    msg!("Attempting to calculate consensus for TXID: {}", txid);
     // Calculate consensus
-    let (consensus_status_result, consensus_hash) = calculate_consensus(&state.reports, &state.contributors, txid);
 
+    let (consensus_status_result, consensus_hash) = calculate_consensus(&state.reports, &state.contributors, txid);
+    msg!("Consensus Reached with {} contributed reports for Pastel TXID: {}, Status: {:?}, Hash: {}", state.reports.len(), txid, consensus_status_result, consensus_hash);
+    
     // Iterate over reports and update contributors
+    msg!("Updating contributors based on consensus results for TXID: {}", txid);
     for report in state.reports.values() {
         if report.txid == *txid {
             if let Some(contributor) = state.contributors.iter_mut().find(|c| c.reward_address == report.contributor_reward_address) {
                 let is_accurate_status = report.txid_status == consensus_status_result;
                 let is_accurate_hash = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
-                
                 let is_accurate = is_accurate_status && is_accurate_hash;
 
+                if is_accurate {msg!("Contributor {} submitted an accurate report for Pastel TXID {}", contributor.reward_address, txid);}
+                else {msg!("Contributor {} submitted an inaccurate report for Pastel TXID {}", contributor.reward_address, txid);}
                 // Update contributor's activity and compliance
                 update_activity_and_compliance_helper(contributor, Clock::get()?.unix_timestamp as u64, is_accurate)?;
             }
@@ -541,6 +561,7 @@ fn calculate_consensus_and_cleanup(state: &mut OracleContractState, txid: &str) 
 
     // Cleanup logic for old reports
     state.reports.retain(|k, _| k != txid);
+    msg!("Old Reports Cleanup for TXID: {}", txid);
 
     Ok(())
 }
@@ -667,6 +688,7 @@ impl Contributor {
             // Cast the calculation result to u32 since reliability_score is u32
             self.reliability_score = (self.accurate_reports_count as f32 / self.total_reports_submitted as f32 * 100.0) as u32;
         }
+        msg!("Reliability Score Updated: Address: {}, Score: {}", self.reward_address, self.reliability_score);
     }
     
     // Method to handle consensus failure
@@ -680,6 +702,7 @@ impl Contributor {
             // Apply permanent ban
             self.ban_expiry = u64::MAX;
         }
+        msg!("Contributor Ban Update: Address: {}, Ban Expiry: {}", self.reward_address, self.ban_expiry);
     }
 
     // Method to check if the contributor is recently active
