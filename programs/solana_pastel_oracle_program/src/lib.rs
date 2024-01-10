@@ -1,5 +1,8 @@
 use anchor_lang::prelude::*;
-use std::collections::HashMap;
+use anchor_lang::solana_program::entrypoint::ProgramResult;
+use anchor_lang::solana_program::account_info::AccountInfo;
+use anchor_lang::solana_program::sysvar::clock::Clock;
+use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::cmp;
 
@@ -16,8 +19,9 @@ const TEMPORARY_BAN_DURATION: u64 = 604800; // Duration of temporary ban in seco
 const MIN_NUMBER_OF_ORACLES: usize = 3; // Minimum number of oracles to calculate consensus
 const MAX_SUBMITTED_RESPONSES_PER_TXID: usize = 100; // Maximum number of responses that can be submitted corresponding to a single txid
 const MAX_STORED_REPORTS: usize = 250; // Maximum number of reports to store before cleanup
-const REPORT_RETENTION_PERIOD: u64 = 10_800; // Retention period in seconds (i.e., 3 hours)
+const CONTRIBUTOR_RETENTION_PERIOD: u64 = 30 * 24 * 60 * 60; // How long to keep contributor data in the contract state when they've been inactive (30 days)
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to retain submission counts (i.e., 24 hours)
+const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 
 #[error_code]
 pub enum OracleError {
@@ -36,6 +40,13 @@ pub enum OracleError {
     Unauthorized,
     InvalidPaymentAmount,
     PaymentNotFound,
+    InvalidOperation
+}
+
+impl From<OracleError> for ProgramError {
+    fn from(e: OracleError) -> Self {
+        ProgramError::Custom(e as u32)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
@@ -89,7 +100,7 @@ pub struct PendingPayment {
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub enum PaymentStatus {
     Pending,
-    Received,
+    Received
 }
 
 #[account]
@@ -100,6 +111,229 @@ pub struct RewardPool {
 #[account]
 pub struct FeeReceivingContract {
     // Since this account is only used for holding and transferring SOL, no fields are necessary.
+}
+
+
+#[account]
+pub struct PastelTxStatusReportAccount {
+    pub report: PastelTxStatusReport,
+}
+
+#[derive(Accounts)]
+#[instruction(txid: String, reward_address: Pubkey)]
+pub struct SubmitDataReport<'info> {
+    #[account(
+        init_if_needed,
+        payer = user,
+        seeds = [b"pastel_tx_status_report", txid.as_bytes(), reward_address.as_ref()],
+        bump,
+        space = 8 + (32 + 1 + 4 + 200 + 8 + 32) // Adjust the space as needed
+    )]
+    pub report_account: Account<'info, PastelTxStatusReportAccount>,
+
+    #[account(mut)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[event]
+pub struct DataReportSubmitted {
+    pub contributor: Pubkey,
+    pub txid: String,
+    pub status: String,
+    pub timestamp: u64,
+}
+
+// Function to update the submission count for a given txid
+fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
+    let current_timestamp = Clock::get()?.unix_timestamp;
+    let current_timestamp_u64 = current_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
+
+    let mut found = false;
+
+    for count in &mut state.txid_submission_counts {
+        if count.txid == txid {
+            count.count += 1;
+            count.last_updated = current_timestamp_u64;
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        state.txid_submission_counts.push(TxidSubmissionCount {
+            txid: txid.to_string(),
+            count: 1,
+            last_updated: current_timestamp_u64,
+        });
+    }
+
+    Ok(())
+}
+
+pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
+    let contributor_key = ctx.accounts.user.key();
+    let state = &mut ctx.accounts.oracle_contract_state;
+    let report_account = &mut ctx.accounts.report_account;
+
+    // Check if the contributor's key matches the report's contributor_reward_address
+    if report.contributor_reward_address != contributor_key {
+        return Err(OracleError::Unauthorized.into());
+    }
+
+    // Validate the report
+    validate_data_contributor_report(&report)?;
+
+    // Check if the contributor is registered, not banned, and store compliance score
+    let mut contributor_compliance_score = 0;
+    let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
+    let contributor_registered = state.contributors.iter().any(|c| {
+        if c.reward_address == contributor_key {
+            if c.calculate_is_banned(current_timestamp) {
+                return false;
+            }
+            contributor_compliance_score = c.compliance_score;
+            true
+        } else {
+            false
+        }
+    });
+
+    if !contributor_registered {
+        return Err(OracleError::UnregisteredOracle.into());
+    }
+
+    // Protect against re-initialization attack
+    if report_account.report.txid != "" && report_account.report.txid != txid {
+        return Err(OracleError::InvalidOperation.into());
+    }
+
+    // Store the report in the PastelTxStatusReportAccount PDA
+    // Clone report for later use
+    let report_clone = report.clone();
+    report_account.report = report;
+
+    // Update the submission count for the given txid
+    update_submission_count(state, &txid)?;
+
+    // Calculate weight
+    let weight = normalize_compliance_score(contributor_compliance_score);
+
+    // Emit an event after storing the report
+    emit!(DataReportSubmitted {
+        contributor: contributor_key,
+        txid: txid.clone(),
+        timestamp: current_timestamp,
+        status: "Report Submitted".to_string(),
+    });
+
+    // Aggregate data for consensus calculation
+    let mut found = false;
+    for data in &mut state.aggregated_consensus_data {
+        if data.txid == txid {
+            data.status_weights[report_clone.txid_status as usize] += weight;
+            if let Some(hash) = &report_clone.first_6_characters_of_sha3_256_hash_of_corresponding_file {
+                *data.hash_weights.entry(hash.clone()).or_insert(0) += weight;
+            }
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        let mut new_data = AggregatedConsensusData {
+            txid: txid.clone(),
+            status_weights: [0; TXID_STATUS_VARIANT_COUNT],
+            hash_weights: BTreeMap::new(),
+        };
+        new_data.status_weights[report_clone.txid_status as usize] += weight;
+        if let Some(hash) = &report_clone.first_6_characters_of_sha3_256_hash_of_corresponding_file {
+            new_data.hash_weights.insert(hash.clone(), weight);
+        }
+        state.aggregated_consensus_data.push(new_data);
+    }
+
+    // Calculate consensus and cleanup if necessary
+    if should_calculate_consensus(state, &txid)? {
+        calculate_consensus_and_cleanup(ctx.program_id, state, &txid)?;
+    }
+
+    // Cleanup old submission counts
+    cleanup_old_submission_counts(state)?;
+
+    Ok(())
+}
+
+
+#[account]
+pub struct ConsensusSummaryAccount {
+    pub summary: ConsensusSummary,
+}
+
+#[derive(Accounts)]
+#[instruction(txid: String)]
+pub struct HandleConsensus<'info> {
+    #[account(
+        init_if_needed,
+        payer = user,
+        seeds = [b"consensus_summary", txid.as_bytes()],
+        bump,
+        space = 8 + std::mem::size_of::<ConsensusSummary>() // Adjust the space as needed
+    )]
+    pub summary_account: Account<'info, ConsensusSummaryAccount>,
+
+    #[account(mut)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[account]
+pub struct PendingPaymentAccount {
+    pub pending_payment: PendingPayment,
+}
+
+#[derive(Accounts)]
+#[instruction(txid: String)]
+pub struct HandlePendingPayment<'info> {
+    #[account(
+        init_if_needed,
+        payer = user,
+        seeds = [b"pending_payment", txid.as_bytes()],
+        bump,
+        space = 8 + std::mem::size_of::<PendingPayment>() // Adjust the space as needed
+    )]
+    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
+
+    #[account(mut)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, pending_payment: PendingPayment) -> ProgramResult {
+    let pending_payment_account = &mut ctx.accounts.pending_payment_account;
+
+    // Ensure the account is being initialized for the first time to avoid re-initialization
+    if pending_payment_account.pending_payment.txid != "" && pending_payment_account.pending_payment.txid != txid {
+        msg!("Attempted to re-initialize an already initialized pending payment account.");
+        return Err(OracleError::InvalidOperation.into());
+    }
+
+    // Store the pending payment in the account
+    pending_payment_account.pending_payment = pending_payment;
+
+    Ok(())
 }
 
 #[derive(Accounts)]
@@ -132,6 +366,7 @@ pub struct Initialize<'info> {
     pub system_program: Program<'info, System>,    
 }
 
+
 #[account]
 pub struct Contributor {
     pub reward_address: Pubkey,
@@ -156,9 +391,7 @@ pub struct OracleContractState {
     pub contributors: Vec<Contributor>,
     pub txid_submission_counts: Vec<TxidSubmissionCount>,
     pub monitored_txids: Vec<String>,
-    pub reports: HashMap<String, PastelTxStatusReport>,
-    pub consensus_summaries: HashMap<String, ConsensusSummary>,
-    pub pending_payments: HashMap<String, PendingPayment>,
+    pub aggregated_consensus_data: Vec<AggregatedConsensusData>,
     pub reward_pool_account: Pubkey,
     pub reward_pool_nonce: u8,
     pub fee_receiving_contract_account: Pubkey,
@@ -166,6 +399,13 @@ pub struct OracleContractState {
     pub bridge_contract_pubkey: Pubkey,
 }
 
+// Struct to hold aggregated data for consensus calculation
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+pub struct AggregatedConsensusData {
+    pub txid: String,
+    pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
+    pub hash_weights: BTreeMap<String, i32>,
+}
 
 #[derive(Accounts)]
 pub struct UpdateActivityAndCompliance<'info> {
@@ -185,6 +425,13 @@ pub struct RequestReward<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[event]
+pub struct RewardEvent {
+    pub contributor: Pubkey,
+    pub amount: u64,
+    pub status: String,
+}
+
 pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
     let contributor = &mut ctx.accounts.contributor;
 
@@ -194,7 +441,7 @@ pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
 
     // Store eligibility and ban status in temporary variables
     let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
-    let is_banned = contributor.is_banned(current_unix_timestamp);
+    let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
 
     // Check if the contributor is eligible for a reward
     if is_eligible_for_rewards && !is_banned {
@@ -205,14 +452,25 @@ pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
         **contributor.to_account_info().lamports.borrow_mut() += reward_amount;
         **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
 
-        // Update state to reflect the reward distribution
-        let contributor_address_str = contributor.reward_address.to_string();
-        let state = &mut ctx.accounts.oracle_contract_state;
-        state.pending_payments.remove(&contributor_address_str);
+        // Emit event for valid reward request
+        emit!(RewardEvent {
+            contributor: contributor.reward_address,
+            amount: reward_amount,
+            status: "Valid Reward Paid".to_string(),
+        });
 
-        msg!("Reward Request: Contributor: {}, Amount: {}", contributor.reward_address, reward_amount);
+        // Update state to reflect the reward distribution
+        msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor.reward_address, reward_amount);
 
     } else {
+        // Emit event for invalid reward request
+        emit!(RewardEvent {
+            contributor: contributor.reward_address,
+            amount: 0,
+            status: format!("Invalid Reward Request: Eligible: {}, Banned: {}", is_eligible_for_rewards, is_banned),
+        });
+
+        msg!("Invalid Reward Request: Contributor: {}, Eligible: {}, Banned: {}", contributor.reward_address, is_eligible_for_rewards, is_banned);
         return Err(OracleError::NotEligibleForReward.into());
     }
     Ok(())
@@ -231,6 +489,12 @@ pub struct RegisterNewDataContributor<'info> {
     pub reward_pool_account: Account<'info, RewardPool>,
     #[account(mut)]
     pub fee_receiving_contract_account: Account<'info, FeeReceivingContract>,
+}
+
+#[event]
+pub struct ContributorRegisteredEvent {
+    pub address: Pubkey,
+    pub timestamp: u64,
 }
 
 pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContributor>) -> Result<()> {
@@ -276,9 +540,32 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     // Append the new contributor to the state
     state.contributors.push(new_contributor);
 
+    // Emit event for new contributor registration
+    emit!(ContributorRegisteredEvent {
+        address: *ctx.accounts.contributor_account.key,
+        timestamp: last_active_timestamp,
+    });
+
     // Logging for debug purposes
     msg!("New Contributor successfully Registered: Address: {}, Timestamp: {}", ctx.accounts.contributor_account.key, last_active_timestamp);
     Ok(())
+}
+
+
+#[event]
+pub struct ContributorUpdatedEvent {
+    pub reward_address: Pubkey,
+    pub last_active_timestamp: u64,
+    pub total_reports_submitted: u32,
+    pub accurate_reports_count: u32,
+    pub current_streak: u32,
+    pub compliance_score: i32,
+    pub reliability_score: u32,
+    pub consensus_failures: u32,
+    pub ban_expiry: u64,
+    pub is_recently_active: bool,
+    pub is_reliable: bool,
+    pub is_eligible_for_rewards: bool,
 }
 
 
@@ -326,9 +613,25 @@ pub fn update_activity_and_compliance_helper(
     }
 
     // Update statuses
-    contributor.is_recently_active = current_timestamp - contributor.last_active_timestamp < 86_400;
-    contributor.is_reliable = contributor.total_reports_submitted != 0 && (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32) >= 0.8;
-    contributor.is_eligible_for_rewards = contributor.total_reports_submitted >= MIN_REPORTS_FOR_REWARD && contributor.is_reliable;
+    contributor.is_recently_active = contributor.calculate_is_recently_active(current_timestamp);
+    contributor.is_reliable = contributor.calculate_is_reliable();
+    contributor.is_eligible_for_rewards = contributor.calculate_is_eligible_for_rewards();
+
+    // Emit event for contributor update
+    emit!(ContributorUpdatedEvent {
+        reward_address: contributor.reward_address,
+        last_active_timestamp: contributor.last_active_timestamp,
+        total_reports_submitted: contributor.total_reports_submitted,
+        accurate_reports_count: contributor.accurate_reports_count,
+        current_streak: contributor.current_streak,
+        compliance_score: contributor.compliance_score,
+        reliability_score: contributor.reliability_score,
+        consensus_failures: contributor.consensus_failures,
+        ban_expiry: contributor.ban_expiry,
+        is_recently_active: contributor.is_recently_active,
+        is_reliable: contributor.is_reliable,
+        is_eligible_for_rewards: contributor.is_eligible_for_rewards,
+    });
 
     msg!("Contributor {} updated: Last Active Timestamp: {}, Total Reports Submitted: {}, Accurate Reports Count: {}, Current Streak: {}, Compliance Score: {}, Reliability Score: {}, Consensus Failures: {}, Ban Expiry: {}, Is Recently Active: {}, Is Reliable: {}, Is Eligible For Rewards: {}", contributor.reward_address, contributor.last_active_timestamp, contributor.total_reports_submitted, contributor.accurate_reports_count, contributor.current_streak, contributor.compliance_score, contributor.reliability_score, contributor.consensus_failures, contributor.ban_expiry, contributor.is_recently_active, contributor.is_reliable, contributor.is_eligible_for_rewards);
 
@@ -360,35 +663,49 @@ pub struct AddTxidForMonitoring<'info> {
     /// CHECK: The caller is manually verified in the instruction logic to ensure it's the correct and authorized account.
     #[account(signer)]
     pub caller: AccountInfo<'info>,
+
+    // The `pending_payment_account` will be initialized in the function
+    #[account(mut)]
+    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
-pub fn add_txid_for_monitoring_helper(
-    ctx: Context<AddTxidForMonitoring>, 
-    data: AddTxidForMonitoringData
-) -> Result<()> {
+#[event]
+pub struct TxidAddedForMonitoringEvent {
+    pub txid: String,
+    pub expected_amount: u64,
+}
+
+pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
     let state = &mut ctx.accounts.oracle_contract_state;
 
-    // Clone the txid at the beginning to avoid ownership issues
-    let txid = data.txid.clone();
-
-    // Verify that the caller is the bridge contract
     if ctx.accounts.caller.key != &state.bridge_contract_pubkey {
-        msg!("Add TXID Authorization failed: Invalid caller (not the Bridge Contract): {}", ctx.accounts.caller.key);
         return Err(OracleError::InvalidAccountData.into());
     }
 
-    msg!("The Pastel Solana Bridge contract is attempting to add a new Pastel TXID for monitoring: {}", data.txid);
-    // Add the TXID to the monitored list and pending payments
+    let txid = data.txid.clone();
+
+    // Add the TXID to the monitored list
     state.monitored_txids.push(txid.clone());
-    state.pending_payments.insert(
-        txid.clone(),
-        PendingPayment {
-            txid,
-            expected_amount: COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
-            payment_status: PaymentStatus::Pending,
-        },
-    );
-    msg!("Successfully Added Pastel TXID for Monitoring: {}", data.txid);
+
+    // Initialize pending_payment_account here using the txid
+    let pending_payment_account = &mut ctx.accounts.pending_payment_account;
+    pending_payment_account.pending_payment = PendingPayment {
+        txid: txid.clone(),
+        expected_amount: COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
+        payment_status: PaymentStatus::Pending,
+    };
+
+    // Emit an event for adding TXID for monitoring
+    emit!(TxidAddedForMonitoringEvent {
+        txid: txid.clone(),
+        expected_amount: COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
+    });
+
+    msg!("Added Pastel TXID for Monitoring and Pending Payment: {}", txid);
     Ok(())
 }
 
@@ -401,9 +718,6 @@ impl<'info> Initialize<'info> {
         state.contributors = Vec::new();
         state.txid_submission_counts = Vec::new();
         state.monitored_txids = Vec::new();
-        state.reports = HashMap::new();
-        state.consensus_summaries = HashMap::new();
-        state.pending_payments = HashMap::new();
         state.bridge_contract_pubkey = Pubkey::default(); // Initialize with default or actual value
         Ok(())
     }
@@ -420,27 +734,16 @@ pub struct ProcessPastelTxStatusReport<'info> {
     // You can add other accounts as needed
 }
 
-#[derive(Accounts)]
-pub struct SubmitDataReport<'info> {
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-
-    /// CHECK: The contributor account is verified in the instruction logic for proper authorization and validity. This includes signature verification and other necessary checks pertinent to the program's requirements.
-    #[account(mut, signer)]
-    pub contributor: AccountInfo<'info>,
-    // Add other necessary accounts
-}
 
 fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Result<bool> {
-    
     // Retrieve the count of submissions and last updated timestamp for the given txid
     let (submission_count, last_updated) = state.txid_submission_counts.iter()
-        .find(|c| c.txid == *txid)
+        .find(|c: &&TxidSubmissionCount| c.txid == *txid)
         .map(|c| (c.count, c.last_updated))
         .unwrap_or((0, 0));
     // Calculate the aspirational minimum target based on reliable and active contributors
     let active_reliable_contributors = state.contributors.iter()
-        .filter(|c| c.is_recently_active(last_updated) && c.is_reliable())
+        .filter(|c| c.calculate_is_recently_active(last_updated) && c.calculate_is_reliable())
         .count();
     // Define the minimum number of reports required before attempting to calculate consensus
     let min_reports_for_consensus = std::cmp::max(MIN_NUMBER_OF_ORACLES, active_reliable_contributors);
@@ -456,40 +759,6 @@ fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<()> 
     Ok(())
 }
 
-pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, report: PastelTxStatusReport) -> Result<()> {
-    let contributor_key = ctx.accounts.contributor.key();
-    let state = &mut ctx.accounts.oracle_contract_state;
-
-    msg!("Data Contributor node {} Attempting to submit a data report for TXID: {}", contributor_key, report.txid);
-
-    // Check if the contributor is registered and not banned
-    let contributor = state.contributors.iter().find(|c| c.reward_address == contributor_key);
-    let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
-    if contributor.is_none() || contributor.unwrap().is_banned(current_timestamp) {
-        return Err(OracleError::UnregisteredOracle.into());
-    }
-
-    let state = &mut ctx.accounts.oracle_contract_state;
-
-    // Validate the report
-    validate_data_contributor_report(&report)?;
-
-    msg!("Report from Data Contributor node {} is valid, now trying to add it to the OracleContractState", contributor_key);
-    // Add or update the report in the OracleContractState
-    state.add_or_update_report(report.clone(), Clock::get()?.unix_timestamp as u64)?;
-
-    msg!("Report from Data Contributor node {} successfully added to the OracleContractState", contributor_key);
-    // Check if consensus should be calculated
-    if should_calculate_consensus(state, &report.txid)? {
-        calculate_consensus_and_cleanup(state, &report.txid)?;
-    }
-
-    // Cleanup old submission counts
-    cleanup_old_submission_counts(state)?;
-
-    Ok(())
-}
-
 // Normalize the compliance score to a positive range, e.g., [0, 100]
 fn normalize_compliance_score(score: i32) -> i32 {
     let max_score = 100;
@@ -500,67 +769,96 @@ fn normalize_compliance_score(score: i32) -> i32 {
     (adjusted_score * max_score) / (max_score - min_score)
 }
 
-fn calculate_consensus(
-    reports: &HashMap<String, PastelTxStatusReport>,
-    contributors: &Vec<Contributor>,
-    txid: &str
-) -> (TxidStatus, String) {
-    let mut weighted_status_counts = HashMap::new();
-    let mut weighted_hash_counts = HashMap::new();
-
-    for report in reports.values() {
-        if report.txid == *txid {
-            if let Some(contributor) = contributors.iter().find(|c| c.reward_address == report.contributor_reward_address) {
-                let weight = normalize_compliance_score(contributor.compliance_score);
-                *weighted_status_counts.entry(report.txid_status).or_insert(0) += weight;
-                if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-                    *weighted_hash_counts.entry(hash.clone()).or_insert(0) += weight;
-                }
-            }
-        }
+fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
+    match index {
+        0 => Some(TxidStatus::Invalid),
+        1 => Some(TxidStatus::PendingMining),
+        2 => Some(TxidStatus::MinedPendingActivation),
+        3 => Some(TxidStatus::MinedActivated),
+        _ => None,
     }
+}
 
-    let consensus_status = weighted_status_counts.iter()
-        .max_by_key(|&(_, &count)| count)
-        .map(|(&status, _)| status)
-        .unwrap_or(TxidStatus::Invalid);
+#[event]
+pub struct ConsensusReachedEvent {
+    pub txid: String,
+    pub status: String,
+    pub hash: String,
+}
 
-    let consensus_hash = weighted_hash_counts.iter()
-        .max_by_key(|&(_, &count)| count)
+fn calculate_consensus_and_cleanup(
+    program_id: &Pubkey,
+    state: &mut OracleContractState, 
+    txid: &str
+) -> Result<()> {
+    let aggregated_data = state.aggregated_consensus_data.iter()
+        .find(|data| data.txid == txid)
+        .ok_or(OracleError::InvalidTxid)?;
+
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    let consensus_status = usize_to_txid_status(
+        aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, &weight)| weight).unwrap_or((0, &0)).0
+    ).unwrap_or(TxidStatus::Invalid);
+
+    let consensus_hash = aggregated_data.hash_weights.iter()
+        .max_by_key(|&(_, weight)| weight)
         .map(|(hash, _)| hash.clone())
         .unwrap_or_default();
 
-    (consensus_status, consensus_hash)
-}
+    let consensus_status_str = match consensus_status {
+        TxidStatus::Invalid => "Invalid",
+        TxidStatus::PendingMining => "PendingMining",
+        TxidStatus::MinedPendingActivation => "MinedPendingActivation",
+        TxidStatus::MinedActivated => "MinedActivated",
+    }.to_string();
 
+    // Emit event for consensus reached
+    emit!(ConsensusReachedEvent {
+        txid: txid.to_string(),
+        status: consensus_status_str,
+        hash: consensus_hash.clone(),
+    });        
 
-fn calculate_consensus_and_cleanup(state: &mut OracleContractState, txid: &str) -> Result<()> {
-    msg!("Attempting to calculate consensus for TXID: {}", txid);
-    // Calculate consensus
+    msg!("Consensus Reached for Pastel TXID: {}, Status: {:?}, Hash: {}", txid, consensus_status, consensus_hash);
 
-    let (consensus_status_result, consensus_hash) = calculate_consensus(&state.reports, &state.contributors, txid);
-    msg!("Consensus Reached with {} contributed reports for Pastel TXID: {}, Status: {:?}, Hash: {}", state.reports.len(), txid, consensus_status_result, consensus_hash);
-    
-    // Iterate over reports and update contributors
-    msg!("Updating contributors based on consensus results for TXID: {}", txid);
-    for report in state.reports.values() {
-        if report.txid == *txid {
-            if let Some(contributor) = state.contributors.iter_mut().find(|c| c.reward_address == report.contributor_reward_address) {
-                let is_accurate_status = report.txid_status == consensus_status_result;
-                let is_accurate_hash = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
-                let is_accurate = is_accurate_status && is_accurate_hash;
+    for contributor in &mut state.contributors {
+        if contributor.ban_expiry > current_timestamp {
+            continue; // Skip banned contributors
+        }
 
-                if is_accurate {msg!("Contributor {} submitted an accurate report for Pastel TXID {}", contributor.reward_address, txid);}
-                else {msg!("Contributor {} submitted an inaccurate report for Pastel TXID {}", contributor.reward_address, txid);}
-                // Update contributor's activity and compliance
-                update_activity_and_compliance_helper(contributor, Clock::get()?.unix_timestamp as u64, is_accurate)?;
-            }
+        let seeds = &[b"pastel_tx_status_report", txid.as_bytes(), contributor.reward_address.as_ref()];
+        let (pda, _bump_seed) = Pubkey::find_program_address(seeds, program_id);
+        
+        // Create a longer-lived AccountInfo instance
+        let mut lamports = 0; // Declare lamports as mutable       
+        let mut data = vec![];
+        let report_account_info = AccountInfo::new(
+            &pda,
+            false, // is_signer
+            true,  // is_writable
+            &mut lamports,
+            &mut data,
+            program_id,
+            false, // is_executable
+            0      // rent_epoch
+        );
+
+        if let Ok(report_account) = Account::<PastelTxStatusReportAccount>::try_from(&report_account_info) {
+            let report = &report_account.report;
+            let is_accurate_status = report.txid_status == consensus_status;
+            let is_accurate_hash = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
+            let is_accurate = is_accurate_status && is_accurate_hash;
+            update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
         }
     }
 
-    // Cleanup logic for old reports
-    state.reports.retain(|k, _| k != txid);
-    msg!("Old Reports Cleanup for TXID: {}", txid);
+    // Cleanup logic: Remove outdated contributors
+    state.contributors.retain(|contributor| {
+        current_timestamp - contributor.last_active_timestamp < CONTRIBUTOR_RETENTION_PERIOD
+    });
+
+    // Cleanup aggregated consensus data for the processed txid
+    state.aggregated_consensus_data.retain(|data| data.txid != txid);
 
     Ok(())
 }
@@ -601,55 +899,19 @@ fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()>
 
 impl OracleContractState {
 
-    pub fn get_eligible_contributors(&self) -> Vec<Pubkey> {
-        self.contributors
-            .iter()
-            .filter(|contributor| contributor.is_eligible_for_rewards)
-            .map(|contributor| contributor.reward_address)
-            .collect()
-    }
-
-    pub fn add_or_update_report(&mut self, report: PastelTxStatusReport, current_time: u64) -> Result<()> {
-        let txid_submission_count = self.txid_submission_counts
-            .iter_mut()
-            .find(|c| c.txid == report.txid);
-
-        if let Some(count) = txid_submission_count {
-            if count.count >= MAX_SUBMITTED_RESPONSES_PER_TXID as u32 {
-                return Err(OracleError::SubmissionCountExceeded.into());
-            }
-            count.count += 1;
-            count.last_updated = current_time;
-        } else {
-            self.txid_submission_counts.push(TxidSubmissionCount {
-                txid: report.txid.clone(),
-                count: 1,
-                last_updated: current_time,
-            });
+    pub fn add_consensus_summary(ctx: Context<HandleConsensus>, txid: String, summary: ConsensusSummary) -> ProgramResult {
+        let summary_account = &mut ctx.accounts.summary_account;
+        // Ensure the account is being initialized for the first time to avoid re-initialization
+        if summary_account.summary.txid != "" && summary_account.summary.txid != txid {
+            msg!("Attempted to re-initialize an already initialized summary account.");
+            return Err(OracleError::InvalidOperation.into());
         }
-
-        let report_with_timestamp = PastelTxStatusReport {
-            timestamp: current_time,
-            ..report
-        };
-
-        if self.reports.len() >= MAX_STORED_REPORTS {
-            self.cleanup_old_reports(current_time);
-        }
-
-        self.reports.insert(report_with_timestamp.txid.clone(), report_with_timestamp);
+        // Store the consensus summary in the account
+        summary_account.summary = summary;
+    
         Ok(())
     }
-
-    pub fn cleanup_old_reports(&mut self, current_time: u64) {
-        self.reports.retain(|_, report| {
-            current_time - report.timestamp < REPORT_RETENTION_PERIOD
-        });
-    }
-
-    pub fn add_consensus_summary(&mut self, summary: ConsensusSummary) {
-        self.consensus_summaries.insert(summary.txid.clone(), summary);
-    }    
+    
 
     pub fn get_highly_reliable_contributors(&self) -> Vec<Contributor> {
         self.contributors.iter()
@@ -674,22 +936,12 @@ impl OracleContractState {
             contributor.handle_consensus_failure(current_time);
         }
 
-        self.contributors.retain(|c| !c.is_banned(current_time));
+        self.contributors.retain(|c| !c.calculate_is_banned(current_time));
     }
 }
 
 impl Contributor {
 
-    // Method to update the reliability score based on the contributor's performance
-    pub fn update_reliability_score(&mut self) {
-        // Calculate the reliability score based on accurate_reports_count and total_reports_submitted
-        if self.total_reports_submitted > 0 {
-            // Cast the calculation result to u32 since reliability_score is u32
-            self.reliability_score = (self.accurate_reports_count as f32 / self.total_reports_submitted as f32 * 100.0) as u32;
-        }
-        msg!("Reliability Score Updated: Address: {}, Score: {}", self.reward_address, self.reliability_score);
-    }
-    
     // Method to handle consensus failure
     pub fn handle_consensus_failure(&mut self, current_time: u64) {
         self.consensus_failures += 1;
@@ -705,7 +957,7 @@ impl Contributor {
     }
 
     // Method to check if the contributor is recently active
-    fn is_recently_active(&self, last_txid_request_time: u64) -> bool {
+    fn calculate_is_recently_active(&self, last_txid_request_time: u64) -> bool {
         // Define a threshold for recent activity (e.g., active within the last 24 hours)
         let recent_activity_threshold = 86_400; // seconds in 24 hours
 
@@ -718,7 +970,7 @@ impl Contributor {
     }
 
     // Method to check if the contributor is reliable
-    fn is_reliable(&self) -> bool {
+    fn calculate_is_reliable(&self) -> bool {
         // Define what makes a contributor reliable
         // For example, a high reliability score which is a ratio of accurate reports to total reports
         if self.total_reports_submitted == 0 {
@@ -730,12 +982,12 @@ impl Contributor {
     }    
 
     // Check if the contributor is currently banned
-    pub fn is_banned(&self, current_time: u64) -> bool {
+    pub fn calculate_is_banned(&self, current_time: u64) -> bool {
         current_time < self.ban_expiry
     }
 
     // Method to determine if the contributor is eligible for rewards
-    pub fn is_eligible_for_rewards(&self) -> bool {
+    pub fn calculate_is_eligible_for_rewards(&self) -> bool {
         self.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
             && self.reliability_score >= 80 
             && self.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD
@@ -760,6 +1012,7 @@ impl<'info> SetBridgeContract<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(txid: String)] // Include txid as part of the instruction
 pub struct ProcessPayment<'info> {
     /// CHECK: This is checked in the handler function to verify it's the bridge contract.
     #[account(signer)]
@@ -768,27 +1021,41 @@ pub struct ProcessPayment<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
+    #[account(
+        mut,
+        seeds = [b"pending_payment", txid.as_bytes()],
+        bump // You won't explicitly include the bump here; it's handled by Anchor
+    )]
+    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
+
     pub system_program: Program<'info, System>,
 }
+
 
 pub fn process_payment_helper(
     ctx: Context<ProcessPayment>, 
     txid: String, 
     amount: u64
 ) -> Result<()> {
-    let state = &mut ctx.accounts.oracle_contract_state;
+    // Access the pending payment account using the txid as a seed
+    let pending_payment_account = &mut ctx.accounts.pending_payment_account;
 
-    if let Some(pending_payment) = state.pending_payments.get_mut(&txid) {
-        if pending_payment.expected_amount != amount {
-            return Err(OracleError::InvalidPaymentAmount.into());
-        }
-        pending_payment.payment_status = PaymentStatus::Received;
-    } else {
+    // Ensure the payment corresponds to the provided txid
+    if pending_payment_account.pending_payment.txid != txid {
         return Err(OracleError::PaymentNotFound.into());
     }
 
+    // Verify the payment amount matches the expected amount
+    if pending_payment_account.pending_payment.expected_amount != amount {
+        return Err(OracleError::InvalidPaymentAmount.into());
+    }
+
+    // Mark the payment as received
+    pending_payment_account.pending_payment.payment_status = PaymentStatus::Received;
+
     Ok(())
 }
+
 
 #[derive(Accounts)]
 pub struct WithdrawFunds<'info> {
@@ -859,8 +1126,8 @@ pub mod solana_pastel_oracle_program {
         process_payment_helper(ctx, txid, amount)
     }
 
-    pub fn submit_data_report(ctx: Context<SubmitDataReport>, report: PastelTxStatusReport) -> Result<()> {
-        submit_data_report_helper(ctx, report)
+    pub fn submit_data_report(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> Result<()> {
+        submit_data_report_helper(ctx, txid, report).map_err(|e| e.into())
     }
 
     pub fn request_reward(ctx: Context<RequestReward>) -> Result<()> {
