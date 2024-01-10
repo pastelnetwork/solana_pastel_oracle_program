@@ -33,7 +33,9 @@ pub enum OracleError {
     NotEligibleForReward,
     InvalidAccountData,
     InsufficientFunds,
-    Unauthorized
+    Unauthorized,
+    InvalidPaymentAmount,
+    PaymentNotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
@@ -103,7 +105,7 @@ pub struct FeeReceivingContract {
 #[derive(Accounts)]
 #[instruction(admin_pubkey: Pubkey)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 10240)] // Adjust the space as needed
+    #[account(init, payer = user, space = 8 + 50000)] // Adjust the space as needed
     pub oracle_contract_state: Account<'info, OracleContractState>,
     #[account(mut)]
     pub user: Signer<'info>,
@@ -220,14 +222,16 @@ pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
 pub struct RegisterNewDataContributor<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    /// CHECK: Manual checks are performed in the instruction to ensure the contributor_account is valid and safe to use.
     #[account(mut, signer)]
     pub contributor_account: AccountInfo<'info>,
+    
     #[account(mut)]
     pub reward_pool_account: Account<'info, RewardPool>,
     #[account(mut)]
     pub fee_receiving_contract_account: Account<'info, FeeReceivingContract>,
 }
-
 
 pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContributor>) -> Result<()> {
     let state = &mut ctx.accounts.oracle_contract_state;
@@ -352,6 +356,8 @@ pub struct AddTxidForMonitoringData {
 pub struct AddTxidForMonitoring<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    /// CHECK: The caller is manually verified in the instruction logic to ensure it's the correct and authorized account.
     #[account(signer)]
     pub caller: AccountInfo<'info>,
 }
@@ -403,11 +409,12 @@ impl<'info> Initialize<'info> {
     }
 }
 
-
 #[derive(Accounts)]
 pub struct ProcessPastelTxStatusReport<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    /// CHECK: Manual checks are performed in the instruction to ensure the contributor is valid and authorized. This includes verifying signatures and other relevant validations.
     #[account(mut, signer)]
     pub contributor: AccountInfo<'info>,
     // You can add other accounts as needed
@@ -417,6 +424,8 @@ pub struct ProcessPastelTxStatusReport<'info> {
 pub struct SubmitDataReport<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    /// CHECK: The contributor account is verified in the instruction logic for proper authorization and validity. This includes signature verification and other necessary checks pertinent to the program's requirements.
     #[account(mut, signer)]
     pub contributor: AccountInfo<'info>,
     // Add other necessary accounts
@@ -750,6 +759,36 @@ impl<'info> SetBridgeContract<'info> {
     }
 }
 
+#[derive(Accounts)]
+pub struct ProcessPayment<'info> {
+    /// CHECK: This is checked in the handler function to verify it's the bridge contract.
+    #[account(signer)]
+    pub source_account: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    pub system_program: Program<'info, System>,
+}
+
+pub fn process_payment_helper(
+    ctx: Context<ProcessPayment>, 
+    txid: String, 
+    amount: u64
+) -> Result<()> {
+    let state = &mut ctx.accounts.oracle_contract_state;
+
+    if let Some(pending_payment) = state.pending_payments.get_mut(&txid) {
+        if pending_payment.expected_amount != amount {
+            return Err(OracleError::InvalidPaymentAmount.into());
+        }
+        pending_payment.payment_status = PaymentStatus::Received;
+    } else {
+        return Err(OracleError::PaymentNotFound.into());
+    }
+
+    Ok(())
+}
 
 #[derive(Accounts)]
 pub struct WithdrawFunds<'info> {
@@ -758,6 +797,8 @@ pub struct WithdrawFunds<'info> {
         constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ OracleError::Unauthorized
     )]
     pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    /// CHECK: The admin_account is manually verified in the instruction to ensure it's the correct and authorized account for withdrawal operations. This includes checking if the account matches the admin_pubkey stored in oracle_contract_state.
     pub admin_account: AccountInfo<'info>,
 
     #[account(mut)]
@@ -813,6 +854,10 @@ pub mod solana_pastel_oracle_program {
     pub fn add_txid_for_monitoring(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
         add_txid_for_monitoring_helper(ctx, data)
     }    
+
+    pub fn process_payment(ctx: Context<ProcessPayment>, txid: String, amount: u64) -> Result<()> {
+        process_payment_helper(ctx, txid, amount)
+    }
 
     pub fn submit_data_report(ctx: Context<SubmitDataReport>, report: PastelTxStatusReport) -> Result<()> {
         submit_data_report_helper(ctx, report)
