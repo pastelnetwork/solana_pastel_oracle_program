@@ -17,8 +17,7 @@ const TEMPORARY_BAN_THRESHOLD: u32 = 5; // Number of non-consensus report submis
 const CONTRIBUTIONS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 contributions
 const TEMPORARY_BAN_DURATION: u64 = 604800; // Duration of temporary ban in seconds (e.g., 1 week)
 const MIN_NUMBER_OF_ORACLES: usize = 3; // Minimum number of oracles to calculate consensus
-const MAX_SUBMITTED_RESPONSES_PER_TXID: usize = 100; // Maximum number of responses that can be submitted corresponding to a single txid
-const MAX_STORED_REPORTS: usize = 250; // Maximum number of reports to store before cleanup
+const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS: u64 = 20 * 60; // Maximum duration in seconds from last report submission for a given TXID before computing consensus (e.g., 20 minutes)
 const CONTRIBUTOR_RETENTION_PERIOD: u64 = 30 * 24 * 60 * 60; // How long to keep contributor data in the contract state when they've been inactive (30 days)
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
@@ -80,14 +79,6 @@ pub struct TxidSubmissionCount {
     pub txid: String,
     pub count: u32,
     pub last_updated: u64,
-}
-
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
-pub struct ConsensusSummary {
-    pub txid: String,
-    pub consensus_status_result: TxidStatus,
-    pub consensus_first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
-    pub contributing_reports_count: u32,
 }
 
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
@@ -269,22 +260,9 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
 }
 
 
-#[account]
-pub struct ConsensusSummaryAccount {
-    pub summary: ConsensusSummary,
-}
-
 #[derive(Accounts)]
 #[instruction(txid: String)]
 pub struct HandleConsensus<'info> {
-    #[account(
-        init_if_needed,
-        payer = user,
-        seeds = [b"consensus_summary", txid.as_bytes()],
-        bump,
-        space = 8 + std::mem::size_of::<ConsensusSummary>() // Adjust the space as needed
-    )]
-    pub summary_account: Account<'info, ConsensusSummaryAccount>,
 
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
@@ -321,7 +299,7 @@ pub struct HandlePendingPayment<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, pending_payment: PendingPayment) -> ProgramResult {
+pub fn add_pending_payment_helper(ctx: Context<HandlePendingPayment>, txid: String, pending_payment: PendingPayment) -> ProgramResult {
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
@@ -709,6 +687,7 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
     Ok(())
 }
 
+
 impl<'info> Initialize<'info> {
     pub fn initialize_oracle_state(&mut self, admin_pubkey: Pubkey) -> Result<()> {
         let state = &mut self.oracle_contract_state;
@@ -734,21 +713,32 @@ pub struct ProcessPastelTxStatusReport<'info> {
     // You can add other accounts as needed
 }
 
-
 fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Result<bool> {
     // Retrieve the count of submissions and last updated timestamp for the given txid
     let (submission_count, last_updated) = state.txid_submission_counts.iter()
-        .find(|c: &&TxidSubmissionCount| c.txid == *txid)
+        .find(|c| c.txid == txid)
         .map(|c| (c.count, c.last_updated))
         .unwrap_or((0, 0));
+
     // Calculate the aspirational minimum target based on reliable and active contributors
     let active_reliable_contributors = state.contributors.iter()
         .filter(|c| c.calculate_is_recently_active(last_updated) && c.calculate_is_reliable())
         .count();
+
     // Define the minimum number of reports required before attempting to calculate consensus
     let min_reports_for_consensus = std::cmp::max(MIN_NUMBER_OF_ORACLES, active_reliable_contributors);
-    // Check if the received reports have reached the minimum threshold
-    Ok(submission_count >= min_reports_for_consensus as u32)
+
+    // Check if the minimum threshold of reports is met
+    let min_threshold_met = submission_count >= min_reports_for_consensus as u32;
+
+    // Get the current unix timestamp from the Solana clock
+    let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+
+    // Check if 20 minutes have elapsed since the last update
+    let max_waiting_period_elapsed_for_txid = current_unix_timestamp - last_updated >= MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS;
+
+    // Calculate consensus if minimum threshold is met or if 20 minutes have passed with at least MIN_NUMBER_OF_ORACLES reports
+    Ok(min_threshold_met || (max_waiting_period_elapsed_for_txid && submission_count >= MIN_NUMBER_OF_ORACLES as u32))
 }
 
 fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<()> {
@@ -784,7 +774,9 @@ pub struct ConsensusReachedEvent {
     pub txid: String,
     pub status: String,
     pub hash: String,
+    pub number_of_contributors_included: u32,
 }
+
 
 fn calculate_consensus_and_cleanup(
     program_id: &Pubkey,
@@ -805,22 +797,7 @@ fn calculate_consensus_and_cleanup(
         .map(|(hash, _)| hash.clone())
         .unwrap_or_default();
 
-    let consensus_status_str = match consensus_status {
-        TxidStatus::Invalid => "Invalid",
-        TxidStatus::PendingMining => "PendingMining",
-        TxidStatus::MinedPendingActivation => "MinedPendingActivation",
-        TxidStatus::MinedActivated => "MinedActivated",
-    }.to_string();
-
-    // Emit event for consensus reached
-    emit!(ConsensusReachedEvent {
-        txid: txid.to_string(),
-        status: consensus_status_str,
-        hash: consensus_hash.clone(),
-    });        
-
-    msg!("Consensus Reached for Pastel TXID: {}, Status: {:?}, Hash: {}", txid, consensus_status, consensus_hash);
-
+    let mut contributor_count = 0;
     for contributor in &mut state.contributors {
         if contributor.ban_expiry > current_timestamp {
             continue; // Skip banned contributors
@@ -829,7 +806,6 @@ fn calculate_consensus_and_cleanup(
         let seeds = &[b"pastel_tx_status_report", txid.as_bytes(), contributor.reward_address.as_ref()];
         let (pda, _bump_seed) = Pubkey::find_program_address(seeds, program_id);
         
-        // Create a longer-lived AccountInfo instance
         let mut lamports = 0; // Declare lamports as mutable       
         let mut data = vec![];
         let report_account_info = AccountInfo::new(
@@ -848,16 +824,30 @@ fn calculate_consensus_and_cleanup(
             let is_accurate_status = report.txid_status == consensus_status;
             let is_accurate_hash = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
             let is_accurate = is_accurate_status && is_accurate_hash;
+
+            if is_accurate || is_accurate_hash {
+                contributor_count += 1;
+            }
+
             update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
         }
     }
+    msg!("Consensus Reached for Pastel TXID: {}, Status: {:?}, Hash: {}", txid, consensus_status, consensus_hash);
 
-    // Cleanup logic: Remove outdated contributors
+    emit!(ConsensusReachedEvent {
+        txid: txid.to_string(),
+        status: format!("{:?}", consensus_status),
+        hash: consensus_hash,
+        number_of_contributors_included: contributor_count,
+    });
+
+    // Call to assess and apply bans
+    state.assess_and_apply_bans(current_timestamp);
+
+    // Cleanup logic
     state.contributors.retain(|contributor| {
         current_timestamp - contributor.last_active_timestamp < CONTRIBUTOR_RETENTION_PERIOD
     });
-
-    // Cleanup aggregated consensus data for the processed txid
     state.aggregated_consensus_data.retain(|data| data.txid != txid);
 
     Ok(())
@@ -899,38 +889,6 @@ fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()>
 
 impl OracleContractState {
 
-    pub fn add_consensus_summary(ctx: Context<HandleConsensus>, txid: String, summary: ConsensusSummary) -> ProgramResult {
-        let summary_account = &mut ctx.accounts.summary_account;
-        // Ensure the account is being initialized for the first time to avoid re-initialization
-        if summary_account.summary.txid != "" && summary_account.summary.txid != txid {
-            msg!("Attempted to re-initialize an already initialized summary account.");
-            return Err(OracleError::InvalidOperation.into());
-        }
-        // Store the consensus summary in the account
-        summary_account.summary = summary;
-    
-        Ok(())
-    }
-    
-
-    pub fn get_highly_reliable_contributors(&self) -> Vec<Contributor> {
-        self.contributors.iter()
-            .filter(|c| c.reliability_score > 80)
-            .cloned()
-            .collect()
-    }
-
-
-    pub fn remove_underperforming_contributor(&mut self, reward_address: Pubkey) {
-        self.contributors.retain(|c| c.reward_address != reward_address);
-    }        
-
-    pub fn is_contributor_banned(&self, reward_address: &Pubkey, current_time: u64) -> bool {
-        self.contributors.iter().any(|c| 
-            &c.reward_address == reward_address && c.ban_expiry > current_time
-        )
-    }
-
     pub fn assess_and_apply_bans(&mut self, current_time: u64) {
         for contributor in &mut self.contributors {
             contributor.handle_consensus_failure(current_time);
@@ -945,7 +903,6 @@ impl Contributor {
     // Method to handle consensus failure
     pub fn handle_consensus_failure(&mut self, current_time: u64) {
         self.consensus_failures += 1;
-
         if self.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && self.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
             // Apply temporary ban
             self.ban_expiry = current_time + TEMPORARY_BAN_DURATION;
@@ -1120,8 +1077,18 @@ pub mod solana_pastel_oracle_program {
 
     pub fn add_txid_for_monitoring(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
         add_txid_for_monitoring_helper(ctx, data)
-    }    
+    }
 
+    pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, expected_amount: u64, payment_status: PaymentStatus) -> Result<()> {
+        let pending_payment = PendingPayment {
+            txid: txid.clone(), // Clone the txid for passing to the helper
+            expected_amount,
+            payment_status,
+        };
+        add_pending_payment_helper(ctx, txid, pending_payment)
+            .map_err(|e| e.into())
+    }
+    
     pub fn process_payment(ctx: Context<ProcessPayment>, txid: String, amount: u64) -> Result<()> {
         process_payment_helper(ctx, txid, amount)
     }
