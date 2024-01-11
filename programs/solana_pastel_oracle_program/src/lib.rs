@@ -2,7 +2,6 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
-use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::cmp;
 
@@ -104,7 +103,6 @@ pub struct FeeReceivingContract {
     // Since this account is only used for holding and transferring SOL, no fields are necessary.
 }
 
-
 #[account]
 pub struct PastelTxStatusReportAccount {
     pub report: PastelTxStatusReport,
@@ -165,6 +163,7 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
 
     Ok(())
 }
+
 
 pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
     let contributor_key = ctx.accounts.user.key();
@@ -228,7 +227,7 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
         if data.txid == txid {
             data.status_weights[report_clone.txid_status as usize] += weight;
             if let Some(hash) = &report_clone.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-                *data.hash_weights.entry(hash.clone()).or_insert(0) += weight;
+                update_hash_weight(&mut data.hash_weights, hash, weight);
             }
             found = true;
             break;
@@ -239,11 +238,14 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
         let mut new_data = AggregatedConsensusData {
             txid: txid.clone(),
             status_weights: [0; TXID_STATUS_VARIANT_COUNT],
-            hash_weights: BTreeMap::new(),
+            hash_weights: Vec::new(), // Initialize as an empty vector
         };
         new_data.status_weights[report_clone.txid_status as usize] += weight;
         if let Some(hash) = &report_clone.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            new_data.hash_weights.insert(hash.clone(), weight);
+            new_data.hash_weights.push(HashWeight { 
+                hash: hash.clone(), 
+                weight 
+            });
         }
         state.aggregated_consensus_data.push(new_data);
     }
@@ -345,7 +347,7 @@ pub struct Initialize<'info> {
 }
 
 
-#[account]
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct Contributor {
     pub reward_address: Pubkey,
     pub registration_entrance_fee_transaction_signature: String,
@@ -362,6 +364,7 @@ pub struct Contributor {
     pub is_reliable: bool,    
 }
 
+
 #[account]
 pub struct OracleContractState {
     pub is_initialized: bool,
@@ -377,20 +380,62 @@ pub struct OracleContractState {
     pub bridge_contract_pubkey: Pubkey,
 }
 
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+pub struct HashWeight {
+    pub hash: String,
+    pub weight: i32,
+}
+
+// Function to update hash weight
+fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &String, weight: i32) {
+    let mut found = false;
+    for hash_weight in hash_weights.iter_mut() { // Use iter_mut() instead of into_iter()
+        if &hash_weight.hash == hash {
+            hash_weight.weight += weight;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        hash_weights.push(HashWeight {
+            hash: hash.clone(),
+            weight,
+        });
+    }
+}
+
 // Struct to hold aggregated data for consensus calculation
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct AggregatedConsensusData {
     pub txid: String,
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
-    pub hash_weights: BTreeMap<String, i32>,
+    pub hash_weights: Vec<HashWeight>,
 }
 
 #[derive(Accounts)]
 pub struct UpdateActivityAndCompliance<'info> {
     #[account(mut)]
-    pub contributor: Account<'info, Contributor>,
+    pub oracle_contract_state: Account<'info, OracleContractState>,
 }
 
+pub fn update_activity_and_compliance(
+    ctx: Context<UpdateActivityAndCompliance>, 
+    contributor_address: Pubkey, // Passed as an argument
+    current_timestamp: u64, 
+    is_accurate: bool
+) -> Result<()> {
+    let oracle_state = &mut ctx.accounts.oracle_contract_state;
+
+    // Find the contributor in the oracle state
+    if let Some(contributor) = oracle_state.contributors.iter_mut().find(|c| c.reward_address == contributor_address) {
+        update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
+    } else {
+        msg!("Contributor not found: {}", contributor_address);
+        return Err(OracleError::UnregisteredOracle.into());
+    }
+
+    Ok(())
+}
 
 #[derive(Accounts)]
 pub struct RequestReward<'info> {
@@ -398,8 +443,6 @@ pub struct RequestReward<'info> {
     pub reward_pool_account: Account<'info, RewardPool>,
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
-    #[account(mut)]
-    pub contributor: Account<'info, Contributor>,
     pub system_program: Program<'info, System>,
 }
 
@@ -410,49 +453,57 @@ pub struct RewardEvent {
     pub status: String,
 }
 
-pub fn request_reward_helper(ctx: Context<RequestReward>) -> Result<()> {
-    let contributor = &mut ctx.accounts.contributor;
+pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
+    let oracle_state = &mut ctx.accounts.oracle_contract_state;
 
-    msg!("Attempting to request reward for contributor: {}", contributor.reward_address);
-    // Convert i64 Unix timestamp to u64
-    let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+    // Temporarily store reward eligibility and amount
+    let mut reward_amount = 0;
+    let mut is_reward_valid = false;
 
-    // Store eligibility and ban status in temporary variables
-    let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
-    let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
+    // Find the contributor in the oracle state and check eligibility
+    if let Some(contributor) = oracle_state.contributors.iter().find(|c| c.reward_address == contributor_address) {
+        let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+        let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
+        let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
 
-    // Check if the contributor is eligible for a reward
-    if is_eligible_for_rewards && !is_banned {
-        // Calculate the reward amount for the contributor
-        let reward_amount = BASE_REWARD_AMOUNT_SOL; // Adjust based on your logic
+        if is_eligible_for_rewards && !is_banned {
+            reward_amount = BASE_REWARD_AMOUNT_SOL; // Adjust based on your logic
+            is_reward_valid = true;
+        }
+    } else {
+        msg!("Contributor not found: {}", contributor_address);
+        return Err(OracleError::UnregisteredOracle.into());
+    }
 
+    // Handle reward transfer and event emission after determining eligibility
+    if is_reward_valid {
         // Transfer the reward from the reward pool to the contributor
-        **contributor.to_account_info().lamports.borrow_mut() += reward_amount;
         **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
+        **ctx.accounts.oracle_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
 
         // Emit event for valid reward request
         emit!(RewardEvent {
-            contributor: contributor.reward_address,
+            contributor: contributor_address,
             amount: reward_amount,
             status: "Valid Reward Paid".to_string(),
         });
 
-        // Update state to reflect the reward distribution
-        msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor.reward_address, reward_amount);
-
+        msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
     } else {
         // Emit event for invalid reward request
         emit!(RewardEvent {
-            contributor: contributor.reward_address,
+            contributor: contributor_address,
             amount: 0,
-            status: format!("Invalid Reward Request: Eligible: {}, Banned: {}", is_eligible_for_rewards, is_banned),
+            status: "Invalid Reward Request".to_string(),
         });
 
-        msg!("Invalid Reward Request: Contributor: {}, Eligible: {}, Banned: {}", contributor.reward_address, is_eligible_for_rewards, is_banned);
+        msg!("Invalid Reward Request: Contributor: {}", contributor_address);
         return Err(OracleError::NotEligibleForReward.into());
     }
+
     Ok(())
 }
+
 
 #[derive(Accounts)]
 pub struct RegisterNewDataContributor<'info> {
@@ -618,16 +669,6 @@ pub fn update_activity_and_compliance_helper(
 }
 
 
-// Anchor instruction
-pub fn update_activity_and_compliance(
-    ctx: Context<UpdateActivityAndCompliance>, 
-    current_timestamp: u64, 
-    is_accurate: bool
-) -> Result<()> {
-    let contributor = &mut ctx.accounts.contributor;
-    update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)
-}
-
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct AddTxidForMonitoringData {
     pub txid: String,
@@ -792,9 +833,10 @@ fn calculate_consensus_and_cleanup(
         aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, &weight)| weight).unwrap_or((0, &0)).0
     ).unwrap_or(TxidStatus::Invalid);
 
+    // Find the hash with the highest weight
     let consensus_hash = aggregated_data.hash_weights.iter()
-        .max_by_key(|&(_, weight)| weight)
-        .map(|(hash, _)| hash.clone())
+        .max_by_key(|hash_weight| hash_weight.weight)
+        .map(|hash_weight| hash_weight.hash.clone())
         .unwrap_or_default();
 
     let mut contributor_count = 0;
@@ -1097,8 +1139,8 @@ pub mod solana_pastel_oracle_program {
         submit_data_report_helper(ctx, txid, report).map_err(|e| e.into())
     }
 
-    pub fn request_reward(ctx: Context<RequestReward>) -> Result<()> {
-        request_reward_helper(ctx)
+    pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
+        request_reward_helper(ctx, contributor_address)
     }
 
     pub fn set_bridge_contract(ctx: Context<SetBridgeContract>, bridge_contract_pubkey: Pubkey) -> Result<()> {

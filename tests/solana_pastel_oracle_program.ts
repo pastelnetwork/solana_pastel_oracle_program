@@ -1,15 +1,17 @@
-import * as anchor from '@project-serum/anchor';
-import { Program, web3 } from '@project-serum/anchor';
-import { AnchorProvider } from '@project-serum/anchor';
+import * as anchor from '@coral-xyz/anchor';
+import { Program, web3 } from  '@coral-xyz/anchor';
+import { AnchorProvider } from '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL } from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
 import fs from 'fs';
 
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
-const programID = anchor.web3.Keypair.fromSecretKey(
-  new Uint8Array(JSON.parse(fs.readFileSync('target/deploy/solana_pastel_oracle_program-keypair.json', 'utf-8')))
-).publicKey;
+// const programID = anchor.web3.Keypair.fromSecretKey(
+//   new Uint8Array(JSON.parse(fs.readFileSync('target/deploy/solana_pastel_oracle_program-keypair.json', 'utf-8')))
+// ).publicKey;
+
+const programID = new anchor.web3.PublicKey("AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNbKAsH2sBsB");
 
 const program = new Program<SolanaPastelOracleProgram>(IDL, programID, provider);
 
