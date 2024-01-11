@@ -1,72 +1,58 @@
 import * as anchor from '@coral-xyz/anchor';
-import { Program, web3 } from  '@coral-xyz/anchor';
-import { AnchorProvider } from '@coral-xyz/anchor';
+import { Program, web3, AnchorProvider} from  '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL } from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
-import fs from 'fs';
 
+process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
-// const programID = anchor.web3.Keypair.fromSecretKey(
-//   new Uint8Array(JSON.parse(fs.readFileSync('target/deploy/solana_pastel_oracle_program-keypair.json', 'utf-8')))
-// ).publicKey;
-
 const programID = new anchor.web3.PublicKey("AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNbKAsH2sBsB");
-
 const program = new Program<SolanaPastelOracleProgram>(IDL, programID, provider);
-
-const admin = web3.Keypair.generate();
+const admin = provider.wallet; // Use the provider's wallet
 const oracleContractState = web3.Keypair.generate();
-const rewardPoolAccount = web3.Keypair.generate();
-const feeReceivingContractAccount = web3.Keypair.generate();
-const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
-const testContributor = web3.Keypair.generate() // Contributor Keypair used across tests
 
-async function airdropSOL(account: web3.PublicKey, amount: number) {
-  const airdropSignature = await provider.connection.requestAirdrop(
-    account,
-    amount * web3.LAMPORTS_PER_SOL // Convert SOL to lamports
-  );
-
-  // Fetch latest blockhash and block height
-  const latestBlockhash = await provider.connection.getLatestBlockhash();
-
-  // Construct the TransactionConfirmationStrategy
-  const confirmationStrategy: anchor.web3.BlockheightBasedTransactionConfirmationStrategy = {
-    signature: airdropSignature,
-    blockhash: latestBlockhash.blockhash,
-    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-  };
-
-  // Confirm the transaction
-  await provider.connection.confirmTransaction(confirmationStrategy, 'finalized');
-}
-
-// Airdrop SOL to your accounts before running tests
-before(async () => {
-  await airdropSOL(admin.publicKey, 10); // Airdrop 10 SOL to the admin account
-});
+console.log("Program ID:", programID.toString()); // Log the public key of the program
+console.log("Admin ID:", admin.publicKey.toString()); // Log the public key of the admin wallet
 
 
 describe('Initialization', () => {
   it('Initializes the oracle contract state', async () => {
-    // New method call syntax
-    await program.methods.initialize(admin.publicKey)
-      .accounts({
-        oracleContractState: oracleContractState.publicKey,
-        user: admin.publicKey,
-        rewardPoolAccount: rewardPoolAccount.publicKey,
-        feeReceivingContractAccount: feeReceivingContractAccount.publicKey,
-        systemProgram: web3.SystemProgram.programId,
-      })
-      .signers([admin, oracleContractState])
-      .rpc();
+    // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
+    const [rewardPoolAccountPDA, rewardPoolAccountBump] = await web3.PublicKey.findProgramAddress(
+      [Buffer.from("reward_pool")],
+      program.programId
+    );
+    const [feeReceivingContractAccountPDA, feeReceivingContractAccountBump] = await web3.PublicKey.findProgramAddress(
+      [Buffer.from("fee_receiving_contract")],
+      program.programId
+    );
 
+    // Calculate the rent-exempt minimum balance
+    const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(8 + 5000000);
+
+    // Initialize the OracleContractState
+    console.log("Initializing Oracle Contract State");
+    await program.methods.initialize(admin.publicKey)
+    .accounts({
+      oracleContractState: oracleContractState.publicKey,
+      user: admin.publicKey,
+      rewardPoolAccount: rewardPoolAccountPDA,
+      feeReceivingContractAccount: feeReceivingContractAccountPDA,
+      systemProgram: web3.SystemProgram.programId,
+    })
+    .signers([oracleContractState]) // Include the state account as a signer
+    .rpc();
+
+    // Fetch the state of the OracleContractState account
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    assert.ok(state.isInitialized);
-    assert.equal(state.adminPubkey.toString(), admin.publicKey.toString());
+    assert.ok(state.isInitialized, "Oracle Contract State should be initialized");
+    assert.equal(state.adminPubkey.toString(), admin.publicKey.toString(), "Admin public key should match");
   });
 });
+
+
+// const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
+// const testContributor = web3.Keypair.generate() // Contributor Keypair used across tests
 
 // describe('Contributor Registration', () => {
 //   it('Registers a new data contributor', async () => {
@@ -80,20 +66,8 @@ describe('Initialization', () => {
 //       })
 //     );
 
-//     // Create a VersionedTransaction
-//     const versionedTransaction = new web3.VersionedTransaction(transaction.compileMessage());
-//     versionedTransaction.sign([admin]);
-
-//     // Send the transaction
-//     const signature = await provider.connection.sendTransaction(versionedTransaction);
-
-//     // Confirm the transaction
-//     const latestBlockhash = await provider.connection.getLatestBlockhash();
-//     await provider.connection.confirmTransaction({
-//       signature: signature,
-//       blockhash: latestBlockhash.blockhash,
-//       lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-//     });
+//     // Sign and send the transaction
+//     await provider.sendAndConfirm(transaction);
 
 //     // Call the RPC method with the new syntax
 //     await program.methods.registerNewDataContributor()
@@ -113,6 +87,7 @@ describe('Initialization', () => {
 //     assert.exists(registeredContributor, 'Contributor should be registered');
 //   });
 // });
+
 
 // describe('Data Report Submission', () => {
 //   it('Submits a data report', async () => {

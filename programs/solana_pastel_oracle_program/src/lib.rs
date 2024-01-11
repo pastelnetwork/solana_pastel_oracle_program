@@ -38,7 +38,9 @@ pub enum OracleError {
     Unauthorized,
     InvalidPaymentAmount,
     PaymentNotFound,
-    InvalidOperation
+    InvalidOperation,
+    IncorrectAdminKey,
+    AccountAlreadyInitialized
 }
 
 impl From<OracleError> for ProgramError {
@@ -116,7 +118,7 @@ pub struct SubmitDataReport<'info> {
         payer = user,
         seeds = [b"pastel_tx_status_report", txid.as_bytes(), reward_address.as_ref()],
         bump,
-        space = 8 + (32 + 1 + 4 + 200 + 8 + 32) // Adjust the space as needed
+        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 25) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
     )]
     pub report_account: Account<'info, PastelTxStatusReportAccount>,
 
@@ -316,36 +318,6 @@ pub fn add_pending_payment_helper(ctx: Context<HandlePendingPayment>, txid: Stri
     Ok(())
 }
 
-#[derive(Accounts)]
-#[instruction(admin_pubkey: Pubkey)]
-pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 50000)] // Adjust the space as needed
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    #[account(
-        init,
-        seeds = [b"reward_pool"],
-        bump,
-        payer = user,
-        space = 8 + 1024 // Adjust the space as needed
-    )]
-    pub reward_pool_account: Account<'info, RewardPool>,
-
-    #[account(
-        init,
-        seeds = [b"fee_receiving_contract"],
-        bump,
-        payer = user,
-        space = 8 + 1024 // Adjust the space as needed
-    )]
-    pub fee_receiving_contract_account: Account<'info, FeeReceivingContract>,
-
-    // System program is needed for account creation
-    pub system_program: Program<'info, System>,    
-}
-
 
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct Contributor {
@@ -379,6 +351,71 @@ pub struct OracleContractState {
     pub fee_receiving_contract_nonce: u8,
     pub bridge_contract_pubkey: Pubkey,
 }
+
+#[derive(Accounts)]
+#[instruction(admin_pubkey: Pubkey)]
+pub struct Initialize<'info> {
+    #[account(init, payer = user, space = 8 + 5000000)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        init,
+        seeds = [b"reward_pool"],
+        bump,
+        payer = user,
+        space = 8 + 1024 // Adjust the space as needed
+    )]
+    pub reward_pool_account: Account<'info, RewardPool>,
+
+    #[account(
+        init,
+        seeds = [b"fee_receiving_contract"],
+        bump,
+        payer = user,
+        space = 8 + 1024 // Adjust the space as needed
+    )]
+    pub fee_receiving_contract_account: Account<'info, FeeReceivingContract>,
+
+    // System program is needed for account creation
+    pub system_program: Program<'info, System>,    
+}
+
+impl<'info> Initialize<'info> {
+    pub fn initialize_oracle_state(&mut self, admin_pubkey: Pubkey) -> Result<()> {
+        msg!("Setting up Oracle Contract State");
+
+        let state = &mut self.oracle_contract_state;
+        // Ensure the oracle_contract_state is not already initialized
+        if state.is_initialized {
+            return Err(OracleError::AccountAlreadyInitialized.into());
+        }
+
+        state.is_initialized = true;
+        state.admin_pubkey = admin_pubkey;
+        msg!("Admin Pubkey set to: {:?}", admin_pubkey);
+
+        state.contributors = Vec::new();
+        msg!("Contributors Vector initialized");
+
+        state.txid_submission_counts = Vec::new();
+        msg!("Txid Submission Counts Vector initialized");
+
+        state.monitored_txids = Vec::new();
+        msg!("Monitored Txids Vector initialized");
+
+        state.aggregated_consensus_data = Vec::new();
+        msg!("Aggregated Consensus Data Vector initialized");
+
+        state.bridge_contract_pubkey = Pubkey::default();
+        msg!("Bridge Contract Pubkey set to default");
+
+        msg!("Oracle Contract State Initialization Complete");
+        Ok(())
+    }
+}
+
 
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct HashWeight {
@@ -728,21 +765,6 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
     Ok(())
 }
 
-
-impl<'info> Initialize<'info> {
-    pub fn initialize_oracle_state(&mut self, admin_pubkey: Pubkey) -> Result<()> {
-        let state = &mut self.oracle_contract_state;
-        // Initialize the OracleContractState
-        state.is_initialized = true;
-        state.admin_pubkey = admin_pubkey;
-        state.contributors = Vec::new();
-        state.txid_submission_counts = Vec::new();
-        state.monitored_txids = Vec::new();
-        state.bridge_contract_pubkey = Pubkey::default(); // Initialize with default or actual value
-        Ok(())
-    }
-}
-
 #[derive(Accounts)]
 pub struct ProcessPastelTxStatusReport<'info> {
     #[account(mut)]
@@ -775,10 +797,10 @@ fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Result
     // Get the current unix timestamp from the Solana clock
     let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    // Check if 20 minutes have elapsed since the last update
+    // Check if N minutes have elapsed since the last update
     let max_waiting_period_elapsed_for_txid = current_unix_timestamp - last_updated >= MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS;
 
-    // Calculate consensus if minimum threshold is met or if 20 minutes have passed with at least MIN_NUMBER_OF_ORACLES reports
+    // Calculate consensus if minimum threshold is met or if N minutes have passed with at least MIN_NUMBER_OF_ORACLES reports
     Ok(min_threshold_met || (max_waiting_period_elapsed_for_txid && submission_count >= MIN_NUMBER_OF_ORACLES as u32))
 }
 
@@ -1110,8 +1132,17 @@ pub mod solana_pastel_oracle_program {
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>, admin_pubkey: Pubkey) -> Result<()> {
-        ctx.accounts.initialize_oracle_state(admin_pubkey)
+        msg!("Initializing Oracle Contract State");
+        ctx.accounts.initialize_oracle_state(admin_pubkey)?;
+        msg!("Oracle Contract State Initialized with Admin Pubkey: {:?}", admin_pubkey);
+    
+        // Logging for Reward Pool and Fee Receiving Contract Accounts
+        msg!("Reward Pool Account: {:?}", ctx.accounts.reward_pool_account.key());
+        msg!("Fee Receiving Contract Account: {:?}", ctx.accounts.fee_receiving_contract_account.key());
+    
+        Ok(())
     }
+    
 
     pub fn register_new_data_contributor(ctx: Context<RegisterNewDataContributor>) -> Result<()> {
         register_new_data_contributor_helper(ctx)

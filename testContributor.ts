@@ -45,7 +45,7 @@ async function main() {
         .rpc();
 
     // Fetch Contributor data
-    const contributorData = await program.account.contributor.fetch(newContributor.publicKey);
+    const contributorData = await program.contributor.fetch(newContributor.publicKey);
 
     console.log("Contributor data:", contributorData);
 }
