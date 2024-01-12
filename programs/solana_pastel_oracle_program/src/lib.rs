@@ -352,10 +352,11 @@ pub struct OracleContractState {
     pub bridge_contract_pubkey: Pubkey,
 }
 
+
 #[derive(Accounts)]
 #[instruction(admin_pubkey: Pubkey)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 5000000)]
+    #[account(init, payer = user, space = 10_240)] // Adjusted space
     pub oracle_contract_state: Account<'info, OracleContractState>,
     #[account(mut)]
     pub user: Signer<'info>,
@@ -412,6 +413,34 @@ impl<'info> Initialize<'info> {
         msg!("Bridge Contract Pubkey set to default");
 
         msg!("Oracle Contract State Initialization Complete");
+        Ok(())
+    }
+}
+
+
+#[derive(Accounts)]
+pub struct ReallocateOracleState<'info> {
+    #[account(mut, has_one = admin_pubkey)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+    pub admin_pubkey: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> ReallocateOracleState<'info> {
+    pub fn execute(ctx: Context<ReallocateOracleState>) -> Result<()> {
+        let oracle_contract_state = &mut ctx.accounts.oracle_contract_state;
+
+        // Calculate new size; add 10,240 bytes for each reallocation
+        // Ensure not to exceed 100KB total size
+        let current_size = oracle_contract_state.to_account_info().data_len();
+        let additional_space = 10_240; // Increment size
+        let max_size = 100 * 1024; // 100KB
+        let new_size = std::cmp::min(current_size + additional_space, max_size);
+
+        // Perform reallocation
+        oracle_contract_state.to_account_info().realloc(new_size, false)?;
+
+        msg!("OracleContractState reallocated to new size: {}", new_size);
         Ok(())
     }
 }
@@ -1143,6 +1172,9 @@ pub mod solana_pastel_oracle_program {
         Ok(())
     }
     
+    pub fn reallocate_oracle_state(ctx: Context<ReallocateOracleState>) -> Result<()> {
+        ReallocateOracleState::execute(ctx)
+    }
 
     pub fn register_new_data_contributor(ctx: Context<RegisterNewDataContributor>) -> Result<()> {
         register_new_data_contributor_helper(ctx)
