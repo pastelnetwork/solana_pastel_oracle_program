@@ -139,27 +139,21 @@ describe('TXID Monitoring', () => {
     const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
     const expectedAmountStr = expectedAmountLamports.toString();
     
-    // Calculate the PDA for pendingPaymentAccount
-    const seed = "pending_payment" + txidToAdd;
-    const pendingPaymentAccountPDA = await web3.PublicKey.createWithSeed(
-      admin.publicKey, // Assuming 'admin' is the user/public key used in your tests
-      seed,
+
+    // Find the PDA for pendingPaymentAccount
+    const [pendingPaymentAccountPDA, pendingPaymentAccountBump] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("pending_payment"), Buffer.from(txidToAdd)],
       program.programId
     );
 
-    console.log("Pending Payment Account PDA:", pendingPaymentAccountPDA.toString());
-    console.log("Oracle Contract State Public Key:", oracleContractState.publicKey.toString());
-    console.log("Admin Public Key:", admin.publicKey.toString());
-    console.log("System Program Public Key:", web3.SystemProgram.programId.toString());
-
     await program.methods.addPendingPayment(txidToAdd, expectedAmountStr, "Pending")
-      .accounts({
-        pendingPaymentAccount: pendingPaymentAccountPDA,
-        oracleContractState: oracleContractState.publicKey,
-        user: admin.publicKey,
-        systemProgram: web3.SystemProgram.programId
-      })
-      .rpc();
+    .accounts({
+      pendingPaymentAccount: pendingPaymentAccountPDA,
+      oracleContractState: oracleContractState.publicKey,
+      user: admin.publicKey,
+      systemProgram: web3.SystemProgram.programId
+    })
+    .rpc();
 
     // Invoke the add_txid_for_monitoring method
     await program.methods.addTxidForMonitoring({ txid: txidToAdd })

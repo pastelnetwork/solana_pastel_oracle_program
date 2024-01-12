@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use std::hash::Hash;
@@ -41,9 +42,7 @@ pub enum OracleError {
     IncorrectAdminKey,
     AccountAlreadyInitialized,
     InvalidAmount,
-    InvalidPaymentStatus,
-    PdaCreationFailed,
-    InvalidPDA,
+    InvalidPaymentStatus
 }
 
 impl From<OracleError> for ProgramError {
@@ -114,13 +113,14 @@ pub struct PastelTxStatusReportAccount {
 }
 
 #[derive(Accounts)]
+#[instruction(txid: String, reward_address: Pubkey)]
 pub struct SubmitDataReport<'info> {
-    // Manually specify the address of the PDA
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 2) //  Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
-        // The address will be set dynamically in the function
+        seeds = [b"pastel_tx_status_report", txid.as_bytes(), reward_address.as_ref()],
+        bump,
+        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 25) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
     )]
     pub report_account: Account<'info, PastelTxStatusReportAccount>,
 
@@ -132,7 +132,6 @@ pub struct SubmitDataReport<'info> {
 
     pub system_program: Program<'info, System>,
 }
-
 
 #[event]
 pub struct DataReportSubmitted {
@@ -170,24 +169,15 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
 }
 
 
-pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> Result<()> {
-    // Calculate the PDA
-    let seed = format!("pastel_tx_status_report{}{}", txid, ctx.accounts.user.key());
-    let report_pda = Pubkey::create_with_seed(
-        &ctx.accounts.user.key(),
-        &seed,
-        &ctx.program_id
-    ).map_err(|_| OracleError::PdaCreationFailed)?;
-
-    // Ensure the provided account matches the calculated PDA
-    require!(
-        ctx.accounts.report_account.to_account_info().key() == report_pda,
-        OracleError::InvalidPDA
-    );
-
+pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
     let contributor_key = ctx.accounts.user.key();
     let state = &mut ctx.accounts.oracle_contract_state;
     let report_account = &mut ctx.accounts.report_account;
+
+    // Check if the contributor's key matches the report's contributor_reward_address
+    if report.contributor_reward_address != contributor_key {
+        return Err(OracleError::Unauthorized.into());
+    }
 
     // Validate the report
     validate_data_contributor_report(&report)?;
@@ -294,13 +284,15 @@ pub struct PendingPaymentAccount {
     pub pending_payment: PendingPayment,
 }
 
-
 #[derive(Accounts)]
+#[instruction(txid: String)]
 pub struct HandlePendingPayment<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + std::mem::size_of::<PendingPayment>()
+        seeds = [b"pending_payment", txid.as_bytes()],
+        bump,
+        space = 8 + std::mem::size_of::<PendingPayment>() // Adjust the space as needed
     )]
     pub pending_payment_account: Account<'info, PendingPaymentAccount>,
 
@@ -313,27 +305,17 @@ pub struct HandlePendingPayment<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn add_pending_payment_helper(ctx: Context<HandlePendingPayment>, txid: String, expected_amount: u64, payment_status: PaymentStatus) -> Result<()> {
-    // Calculate the PDA
-    let seed = format!("pending_payment{}", txid);
-    let pending_payment_pda = Pubkey::create_with_seed(
-        &ctx.accounts.user.key(),
-        &seed,
-        &ctx.program_id
-    ).map_err(|_| OracleError::PdaCreationFailed)?;
+pub fn add_pending_payment_helper(ctx: Context<HandlePendingPayment>, txid: String, pending_payment: PendingPayment) -> ProgramResult {
+    let pending_payment_account = &mut ctx.accounts.pending_payment_account;
 
-    // Ensure the provided account matches the calculated PDA
-    require!(
-        ctx.accounts.pending_payment_account.to_account_info().key() == pending_payment_pda,
-        OracleError::InvalidPDA
-    );
+    // Ensure the account is being initialized for the first time to avoid re-initialization
+    if pending_payment_account.pending_payment.txid != "" && pending_payment_account.pending_payment.txid != txid {
+        msg!("Attempted to re-initialize an already initialized pending payment account.");
+        return Err(OracleError::InvalidOperation.into());
+    }
 
     // Store the pending payment in the account
-    ctx.accounts.pending_payment_account.pending_payment = PendingPayment {
-        txid,
-        expected_amount,
-        payment_status,
-    };
+    pending_payment_account.pending_payment = pending_payment;
 
     Ok(())
 }
@@ -1215,9 +1197,16 @@ pub mod solana_pastel_oracle_program {
             _ => return Err(OracleError::InvalidPaymentStatus.into()),
         };
     
-        add_pending_payment_helper(ctx, txid, expected_amount, payment_status)
+        let pending_payment = PendingPayment {
+            txid: txid.clone(),
+            expected_amount,
+            payment_status,
+        };
+    
+        add_pending_payment_helper(ctx, txid, pending_payment)
             .map_err(|e| e.into())
     }
+    
     
     pub fn process_payment(ctx: Context<ProcessPayment>, txid: String, amount: u64) -> Result<()> {
         process_payment_helper(ctx, txid, amount)
