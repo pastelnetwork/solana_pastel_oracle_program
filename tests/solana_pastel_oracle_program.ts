@@ -1,5 +1,5 @@
 import * as anchor from '@coral-xyz/anchor';
-import { Program, web3, AnchorProvider } from '@coral-xyz/anchor';
+import { Program, web3, AnchorProvider, BN} from '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL } from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
 
@@ -130,3 +130,55 @@ describe('Contributor Registration', () => {
   });
 });
 
+const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.01;
+
+describe('TXID Monitoring', () => {
+  it('Adds a new TXID for monitoring', async () => {
+    // Setup
+    const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
+    const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
+    const expectedAmountStr = expectedAmountLamports.toString();
+    
+    // Calculate the PDA for pendingPaymentAccount
+    const seed = "pending_payment" + txidToAdd;
+    const pendingPaymentAccountPDA = await web3.PublicKey.createWithSeed(
+      admin.publicKey, // Assuming 'admin' is the user/public key used in your tests
+      seed,
+      program.programId
+    );
+
+    console.log("Pending Payment Account PDA:", pendingPaymentAccountPDA.toString());
+    console.log("Oracle Contract State Public Key:", oracleContractState.publicKey.toString());
+    console.log("Admin Public Key:", admin.publicKey.toString());
+    console.log("System Program Public Key:", web3.SystemProgram.programId.toString());
+
+    await program.methods.addPendingPayment(txidToAdd, expectedAmountStr, "Pending")
+      .accounts({
+        pendingPaymentAccount: pendingPaymentAccountPDA,
+        oracleContractState: oracleContractState.publicKey,
+        user: admin.publicKey,
+        systemProgram: web3.SystemProgram.programId
+      })
+      .rpc();
+
+    // Invoke the add_txid_for_monitoring method
+    await program.methods.addTxidForMonitoring({ txid: txidToAdd })
+      .accounts({
+        oracleContractState: oracleContractState.publicKey,
+        caller: admin.publicKey,
+        pendingPaymentAccount: pendingPaymentAccountPDA,
+        user: admin.publicKey,
+        systemProgram: web3.SystemProgram.programId
+      })
+      .rpc();
+
+    // Fetch the updated state
+    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(pendingPaymentAccountPDA);
+
+    // Assertions
+    assert(state.monitoredTxids.includes(txidToAdd), 'The TXID should be added to the monitored list');
+    assert.strictEqual(pendingPaymentData.pendingPayment.expectedAmount.toNumber(), expectedAmountLamports, 'The expected amount for pending payment should match');
+    console.log('TXID successfully added for monitoring');
+  });
+});
