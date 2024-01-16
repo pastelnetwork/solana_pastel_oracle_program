@@ -106,7 +106,7 @@ describe('Set Bridge Contract', () => {
 });
 
 
-const REGISTRATION_ENTRANCE_FEE_SOL = 0.001;
+const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
 const testContributor = web3.Keypair.generate(); // Contributor Keypair used across tests
 
 describe('Contributor Registration', () => {
@@ -152,7 +152,7 @@ describe('Contributor Registration', () => {
   });
 });
 
-const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.01;
+const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 
 describe('TXID Monitoring', () => {
   it('Adds a new TXID for monitoring', async () => {
@@ -173,7 +173,7 @@ describe('TXID Monitoring', () => {
 
     // Find the PDA for pendingPaymentAccount using the hashed seed (first 32 bytes)
     const [pendingPaymentAccountPDA, pendingPaymentAccountBump] = await web3.PublicKey.findProgramAddressSync(
-      [seedHash.slice(0, 32)],
+      [Uint8Array.prototype.subarray.call(seedHash, 0, 32)],
       program.programId
     );
 
