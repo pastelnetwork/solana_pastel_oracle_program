@@ -2,8 +2,10 @@ import * as anchor from '@coral-xyz/anchor';
 import { Program, web3, AnchorProvider, BN} from '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL } from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
+import * as crypto from 'crypto';
 
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
+process.env.RUST_LOG = "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
 const programID = new anchor.web3.PublicKey("AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNbKAsH2sBsB");
@@ -84,7 +86,27 @@ describe('Initialization', () => {
   });
 });
 
-const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
+
+describe('Set Bridge Contract', () => {
+  it('Sets the bridge contract address to admin address', async () => {
+    await program.methods.setBridgeContract(admin.publicKey)
+      .accounts({
+        oracleContractState: oracleContractState.publicKey,
+        adminPubkey: admin.publicKey,
+      })
+      .rpc();
+
+    // Fetch the updated state to verify the bridge contract address
+    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+
+    // Assertions
+    assert.strictEqual(state.bridgeContractPubkey.toString(), admin.publicKey.toString(), 'The bridge contract pubkey should be set to the admin address');
+    console.log('Bridge contract address set to admin address');
+  });
+});
+
+
+const REGISTRATION_ENTRANCE_FEE_SOL = 0.001;
 const testContributor = web3.Keypair.generate(); // Contributor Keypair used across tests
 
 describe('Contributor Registration', () => {
@@ -136,13 +158,22 @@ describe('TXID Monitoring', () => {
   it('Adds a new TXID for monitoring', async () => {
     // Setup
     const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
+
     const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
     const expectedAmountStr = expectedAmountLamports.toString();
-    
 
-    // Find the PDA for pendingPaymentAccount
+    // Concatenate "pending_payment", txidToAdd, and the byte array of admin's public key
+    const preimage = Buffer.concat([
+      Buffer.from("pending_payment"),
+      Buffer.from(txidToAdd),
+      admin.publicKey.toBuffer()  // This gets the raw byte array of the public key
+    ]);
+
+    const seedHash = crypto.createHash('sha256').update(preimage).digest();
+
+    // Find the PDA for pendingPaymentAccount using the hashed seed (first 32 bytes)
     const [pendingPaymentAccountPDA, pendingPaymentAccountBump] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("pending_payment"), Buffer.from(txidToAdd)],
+      [seedHash.slice(0, 32)],
       program.programId
     );
 

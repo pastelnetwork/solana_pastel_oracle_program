@@ -2,14 +2,14 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
-use std::hash::Hash;
+use anchor_lang::solana_program::hash::{hash, Hash};
 use std::cmp;
 
-const REGISTRATION_ENTRANCE_FEE_SOL: u64 = 10_000_000; // 0.10 SOL in lamports
+const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
 const MIN_REPORTS_FOR_REWARD: u32 = 100; // Data Contributor must submit at least 100 reports to be eligible for rewards
 const MIN_COMPLIANCE_SCORE_FOR_REWARD: i32 = 80; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
-const BASE_REWARD_AMOUNT_SOL: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount, which is scaled based on the number of highly reliable contributors
-const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
+const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount, which is scaled based on the number of highly reliable contributors
+const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const PERMANENT_BAN_THRESHOLD: u32 = 100; // Number of non-consensus report submissions for permanent ban
 const CONTRIBUTIONS_FOR_PERMANENT_BAN: u32 = 250; // Considered for permanent ban after 250 contributions
 const TEMPORARY_BAN_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
@@ -20,6 +20,8 @@ const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSE
 const CONTRIBUTOR_RETENTION_PERIOD: u64 = 30 * 24 * 60 * 60; // How long to keep contributor data in the contract state when they've been inactive (30 days)
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
+const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
+
 
 #[error_code]
 pub enum OracleError {
@@ -33,7 +35,7 @@ pub enum OracleError {
     InvalidTimestamp,
     RegistrationFeeNotPaid,
     NotEligibleForReward,
-    InvalidAccountData,
+    NotBridgeContractAddress,
     InsufficientFunds,
     Unauthorized,
     InvalidPaymentAmount,
@@ -49,6 +51,14 @@ impl From<OracleError> for ProgramError {
     fn from(e: OracleError) -> Self {
         ProgramError::Custom(e as u32)
     }
+}
+
+pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> Hash {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(seed_preamble.as_bytes());
+    preimage.extend_from_slice(txid.as_bytes());
+    preimage.extend_from_slice(reward_address.as_ref());
+    hash(&preimage)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
@@ -84,14 +94,14 @@ pub struct TxidSubmissionCount {
     pub last_updated: u64,
 }
 
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub struct PendingPayment {
     pub txid: String,
     pub expected_amount: u64,
     pub payment_status: PaymentStatus,
 }
 
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub enum PaymentStatus {
     Pending,
     Received
@@ -118,9 +128,9 @@ pub struct SubmitDataReport<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        seeds = [b"pastel_tx_status_report", txid.as_bytes(), reward_address.as_ref()],
+        seeds = [create_seed("pastel_tx_status_report", &txid, &reward_address).as_ref()],
         bump,
-        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 25) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
+        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 5) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
     )]
     pub report_account: Account<'info, PastelTxStatusReportAccount>,
 
@@ -290,9 +300,9 @@ pub struct HandlePendingPayment<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        seeds = [b"pending_payment", txid.as_bytes()],
+        seeds = [create_seed("pending_payment", &txid, &user.key()).as_ref()],
         bump,
-        space = 8 + std::mem::size_of::<PendingPayment>() // Adjust the space as needed
+        space = 8 + std::mem::size_of::<PendingPayment>() + 64 // Adjusted for discriminator
     )]
     pub pending_payment_account: Account<'info, PendingPaymentAccount>,
 
@@ -305,7 +315,11 @@ pub struct HandlePendingPayment<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn add_pending_payment_helper(ctx: Context<HandlePendingPayment>, txid: String, pending_payment: PendingPayment) -> ProgramResult {
+pub fn add_pending_payment_helper(
+    ctx: Context<HandlePendingPayment>, 
+    txid: String, 
+    pending_payment: PendingPayment
+) -> ProgramResult {
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
@@ -314,12 +328,22 @@ pub fn add_pending_payment_helper(ctx: Context<HandlePendingPayment>, txid: Stri
         return Err(OracleError::InvalidOperation.into());
     }
 
+    // Ensure txid is correct and other fields are properly set
+    if pending_payment.txid != txid {
+        msg!("TXID mismatch in pending payment initialization.");
+        return Err(OracleError::InvalidTxid.into());
+    }
+
     // Store the pending payment in the account
     pending_payment_account.pending_payment = pending_payment;
 
+    msg!("Pending payment account initialized: TXID: {}, Expected Amount: {}, Status: {:?}", 
+        pending_payment_account.pending_payment.txid, 
+        pending_payment_account.pending_payment.expected_amount, 
+        pending_payment_account.pending_payment.payment_status);
+
     Ok(())
 }
-
 
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct Contributor {
@@ -535,7 +559,7 @@ pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: P
         let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
 
         if is_eligible_for_rewards && !is_banned {
-            reward_amount = BASE_REWARD_AMOUNT_SOL; // Adjust based on your logic
+            reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
             is_reward_valid = true;
         }
     } else {
@@ -606,7 +630,7 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
 
     msg!("Checking registration fee payment for new contributor: {}", ctx.accounts.contributor_account.key);
     // Check if the fee_receiving_contract_account received the registration fee
-    if ctx.accounts.fee_receiving_contract_account.to_account_info().lamports() < REGISTRATION_ENTRANCE_FEE_SOL {
+    if ctx.accounts.fee_receiving_contract_account.to_account_info().lamports() < REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS {
         return Err(OracleError::RegistrationFeeNotPaid.into());
     }
 
@@ -770,10 +794,15 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
     let state = &mut ctx.accounts.oracle_contract_state;
 
     if ctx.accounts.caller.key != &state.bridge_contract_pubkey {
-        return Err(OracleError::InvalidAccountData.into());
+        return Err(OracleError::NotBridgeContractAddress.into());
     }
 
+    // Explicitly cast txid to String and ensure it meets requirements
     let txid = data.txid.clone();
+    if txid.len() > MAX_TXID_LENGTH {
+        msg!("TXID exceeds maximum length.");
+        return Err(OracleError::InvalidTxid.into());
+    }
 
     // Add the TXID to the monitored list
     state.monitored_txids.push(txid.clone());
@@ -782,19 +811,20 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
     pending_payment_account.pending_payment = PendingPayment {
         txid: txid.clone(),
-        expected_amount: COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
-        payment_status: PaymentStatus::Pending,
+        expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
+        payment_status: PaymentStatus::Pending, // Enum, no need for casting
     };
 
     // Emit an event for adding TXID for monitoring
     emit!(TxidAddedForMonitoringEvent {
         txid: txid.clone(),
-        expected_amount: COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
+        expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
     });
 
-    msg!("Added Pastel TXID for Monitoring and Pending Payment: {}", txid);
+    msg!("Added Pastel TXID for Monitoring: {}", pending_payment_account.pending_payment.txid);
     Ok(())
 }
+
 
 #[derive(Accounts)]
 pub struct ProcessPastelTxStatusReport<'info> {
@@ -898,8 +928,9 @@ fn calculate_consensus_and_cleanup(
             continue; // Skip banned contributors
         }
 
-        let seeds = &[b"pastel_tx_status_report", txid.as_bytes(), contributor.reward_address.as_ref()];
-        let (pda, _bump_seed) = Pubkey::find_program_address(seeds, program_id);
+        // Use the new create_seed function to generate the seed
+        let seed = create_seed("pastel_tx_status_report", txid, &contributor.reward_address);
+        let (pda, _bump_seed) = Pubkey::find_program_address(&[seed.as_ref()], program_id);
         
         let mut lamports = 0; // Declare lamports as mutable       
         let mut data = vec![];
@@ -1063,6 +1094,7 @@ impl<'info> SetBridgeContract<'info> {
     }
 }
 
+
 #[derive(Accounts)]
 #[instruction(txid: String)] // Include txid as part of the instruction
 pub struct ProcessPayment<'info> {
@@ -1075,7 +1107,7 @@ pub struct ProcessPayment<'info> {
 
     #[account(
         mut,
-        seeds = [b"pending_payment", txid.as_bytes()],
+        seeds = [create_seed("pending_payment", &txid, &source_account.key()).as_ref()],
         bump // You won't explicitly include the bump here; it's handled by Anchor
     )]
     pub pending_payment_account: Account<'info, PendingPaymentAccount>,
