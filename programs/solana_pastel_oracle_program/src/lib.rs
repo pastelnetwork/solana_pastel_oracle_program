@@ -67,7 +67,7 @@ impl From<OracleError> for ProgramError {
 
 pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> Hash {
     // Concatenate the string representations. Reward address is Base58-encoded by default.
-    let preimage_string = format!("{}{}{}", seed_preamble, txid, reward_address.to_string());
+    let preimage_string = format!("{}{}{}", seed_preamble, txid, reward_address);
     msg!("create_seed: generated preimage string: {}", preimage_string);
 
     // Convert the concatenated string to bytes
@@ -226,7 +226,7 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
         return Err(OracleError::ContributorNotRegisteredOrBanned.into());
     }
 
-    if report_account.report.txid != "" && report_account.report.txid != txid {
+    if !report_account.report.txid.is_empty() && report_account.report.txid != txid {
         return Err(OracleError::ReportReinitializationDetected.into());
     }
 
@@ -329,7 +329,7 @@ pub fn add_pending_payment_helper(
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
-    if pending_payment_account.pending_payment.txid != "" && pending_payment_account.pending_payment.txid != txid {
+    if !pending_payment_account.pending_payment.txid.is_empty() && pending_payment_account.pending_payment.txid != txid {
         msg!("Attempted to re-initialize an already initialized pending payment account.");
         return Err(OracleError::InvalidOperation.into());
     }
@@ -652,7 +652,7 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
         reward_address: *ctx.accounts.contributor_account.key,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
         compliance_score: 0, // Initial compliance score
-        last_active_timestamp: last_active_timestamp, // Set the last active timestamp to the current time
+        last_active_timestamp, // Set the last active timestamp to the current time
         total_reports_submitted: 0, // Initially, no reports have been submitted
         accurate_reports_count: 0, // Initially, no accurate reports
         current_streak: 0, // No streak at the beginning
@@ -1003,7 +1003,7 @@ fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()>
     }
     // Validate the SHA3-256 hash of the corresponding file
     if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-        if hash.len() != 6 || !hash.chars().all(|c| c.is_digit(16)) {
+        if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(OracleError::InvalidFileHashLength.into());
         }
     } else {
