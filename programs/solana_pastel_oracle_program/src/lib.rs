@@ -3,6 +3,7 @@ use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
+
 use std::cmp;
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
@@ -44,7 +45,9 @@ pub enum OracleError {
     IncorrectAdminKey,
     AccountAlreadyInitialized,
     InvalidAmount,
-    InvalidPaymentStatus
+    InvalidPaymentStatus,
+    InvalidTxidStatus,
+    InvalidPastelTicketType
 }
 
 impl From<OracleError> for ProgramError {
@@ -58,8 +61,18 @@ pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> 
     preimage.extend_from_slice(seed_preamble.as_bytes());
     preimage.extend_from_slice(txid.as_bytes());
     preimage.extend_from_slice(reward_address.as_ref());
-    hash(&preimage)
+
+    // Debugging logs
+    msg!("create_seed: generated preimage: {:?}", preimage);
+
+    let seed_hash = hash(&preimage);
+
+    // Log the generated hash
+    msg!("create_seed: generated seed hash: {:?}", seed_hash);
+
+    seed_hash
 }
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum TxidStatus {
@@ -69,12 +82,37 @@ pub enum TxidStatus {
     MinedActivated,
 }
 
+impl TxidStatus {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(TxidStatus::Invalid),
+            1 => Some(TxidStatus::PendingMining),
+            2 => Some(TxidStatus::MinedPendingActivation),
+            3 => Some(TxidStatus::MinedActivated),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum PastelTicketType {
     Sense,
     Cascade,
     Nft,
     InferenceApi,
+}
+
+
+impl PastelTicketType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(PastelTicketType::Sense),
+            1 => Some(PastelTicketType::Cascade),
+            2 => Some(PastelTicketType::Nft),
+            3 => Some(PastelTicketType::InferenceApi),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
@@ -1244,7 +1282,27 @@ pub mod solana_pastel_oracle_program {
         process_payment_helper(ctx, txid, amount)
     }
 
-    pub fn submit_data_report(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> Result<()> {
+    pub fn submit_data_report(
+        ctx: Context<SubmitDataReport>, 
+        txid: String, 
+        txid_status: u8, 
+        pastel_ticket_type: u8, 
+        first_6_characters_hash: String, 
+        timestamp: u64, 
+        contributor_reward_address: Pubkey
+    ) -> Result<()> {
+        let txid_status = TxidStatus::from_u8(txid_status).ok_or(OracleError::InvalidTxidStatus)?;
+        let pastel_ticket_type = PastelTicketType::from_u8(pastel_ticket_type).ok_or(OracleError::InvalidPastelTicketType)?;
+    
+        let report = PastelTxStatusReport {
+            txid: txid.clone(),
+            txid_status,
+            pastel_ticket_type: Some(pastel_ticket_type),
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: Some(first_6_characters_hash),
+            timestamp,
+            contributor_reward_address,
+        };
+    
         submit_data_report_helper(ctx, txid, report).map_err(|e| e.into())
     }
 

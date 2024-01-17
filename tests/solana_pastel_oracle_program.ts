@@ -1,6 +1,6 @@
 import * as anchor from '@coral-xyz/anchor';
 import { Program, web3, AnchorProvider, BN} from '@coral-xyz/anchor';
-import { SolanaPastelOracleProgram, IDL } from '../target/types/solana_pastel_oracle_program';
+import { SolanaPastelOracleProgram, IDL} from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
 import * as crypto from 'crypto';
 
@@ -207,3 +207,108 @@ describe('TXID Monitoring', () => {
     console.log('TXID successfully added for monitoring');
   });
 });
+
+
+describe('Data Report Submission', () => {
+  it('Submits a data report for a monitored TXID', async () => {
+    // Setup
+    const txidToReport = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
+    console.log('TXID to Report:', txidToReport);
+
+    // Enum mappings
+    const TxidStatusEnum = {
+      Invalid: 0,
+      PendingMining: 1,
+      MinedPendingActivation: 2,
+      MinedActivated: 3
+    };
+
+    const PastelTicketTypeEnum = {
+      Sense: 0,
+      Cascade: 1,
+      Nft: 2,
+      InferenceApi: 3
+    };
+
+    // Convert to numeric representations
+    const txidStatusValue = TxidStatusEnum['MinedActivated']; // Assuming 'MinedActivated' corresponds to 3
+    const pastelTicketTypeValue = PastelTicketTypeEnum['Nft']; // Assuming 'Nft' corresponds to 2
+    console.log(`TXID Status Value: ${txidStatusValue}, Pastel Ticket Type Value: ${pastelTicketTypeValue}`);
+
+    const timestamp = new BN(Date.now() / 1000);
+
+    console.log('String Seed:', Buffer.from("pastel_tx_status_report").toString('hex'));
+    console.log('TXID:', txidToReport);
+    console.log('Public Key:', testContributor.publicKey.toBuffer().toString('hex'));
+
+        // Concatenate the bytes
+    const preimage = Buffer.concat([
+      Buffer.from("pastel_tx_status_report"),
+      Buffer.from(txidToReport),
+      testContributor.publicKey.toBuffer()
+    ]);
+
+    // Compute hash of the preimage
+    const seedHash = crypto.createHash('sha256').update(preimage).digest();
+    console.log('Seed Hash:', seedHash.toString('hex'));
+
+    // Use the first 32 bytes of the hash as the seed
+    const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [seedHash],
+      program.programId
+    );
+    console.log('Report Account PDA:', reportAccountPDA.toString());
+
+    // Submit the data report
+    await program.methods.submitDataReport(
+      txidToReport,
+      txidStatusValue,
+      pastelTicketTypeValue,
+      'abcdef',
+      timestamp,
+      testContributor.publicKey
+    )
+    .accounts({
+      reportAccount: reportAccountPDA,
+      oracleContractState: oracleContractState.publicKey,
+      user: testContributor.publicKey,
+      systemProgram: web3.SystemProgram.programId
+    })
+    .signers([testContributor])
+    .rpc();
+    console.log('Data report submitted');
+
+    // Fetch the updated state
+    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    
+    // Verification
+    // Fetch the updated state of the report account
+    const reportAccount = await program.account.pastelTxStatusReportAccount.fetch(reportAccountPDA);
+    console.log('Report Account Data:', reportAccount);
+
+    // Check if the report details match the submission
+    assert.strictEqual(reportAccount.report.txid, txidToReport, "TXID in report should match the submitted TXID");
+    assert.strictEqual(reportAccount.report.txidStatus.toString(), "MinedActivated", "TXID Status should match the submitted status");
+    assert.strictEqual(reportAccount.report.pastelTicketType.toString(), "Nft", "Pastel Ticket Type should match the submitted type");
+    
+    // Fetch the updated oracle contract state
+    const oracleState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    console.log('Oracle Contract State:', oracleState);
+
+    // Check if the txid is in the monitored list
+    assert(oracleState.monitoredTxids.includes(txidToReport), "TXID should be in the monitored list");
+
+    // Find the contributor in the updated oracle contract state
+    const contributor = oracleState.contributors.find(c => c.rewardAddress.equals(testContributor.publicKey));
+    console.log('Contributor Data:', contributor);
+
+    // Check if the contributor's details are updated
+    assert(contributor !== undefined, "Contributor should exist in the oracle contract state");
+    assert(contributor.totalReportsSubmitted > 0, "Total reports submitted should be updated");
+    assert(contributor.complianceScore >= 0, "Compliance score should be updated");
+    assert(contributor.reliabilityScore >= 0, "Reliability score should be updated");
+
+    console.log('Data report submission verification successful for the TXID:', txidToReport);
+  });
+});
+
