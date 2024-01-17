@@ -16,5 +16,5 @@ wallet = "/home/ubuntu/.config/solana/id.json"
 
 [scripts]
 build = "RUSTUP_TOOLCHAIN=nightly cargo build --release"
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+test = "sh scripts/run_tests_with_logs.sh"
 

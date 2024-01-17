@@ -172,13 +172,27 @@ pub struct DataReportSubmitted {
 
 // Function to update the submission count for a given txid
 fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
+    msg!("update_submission_count: Entry");
+    msg!("txid: {}", txid);
+
+    // Get the current timestamp
     let current_timestamp = Clock::get()?.unix_timestamp;
-    let current_timestamp_u64 = current_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
+    msg!("Current timestamp (before conversion): {}", current_timestamp);
+
+    // Convert the timestamp to u64
+    let current_timestamp_u64 = current_timestamp.try_into().map_err(|_| {
+        msg!("Error: Invalid timestamp conversion");
+        OracleError::InvalidTimestamp
+    })?;
+    msg!("Current timestamp (u64): {}", current_timestamp_u64);
 
     let mut found = false;
 
+    // Iterate through txid submission counts
     for count in &mut state.txid_submission_counts {
+        msg!("Checking txid: {}", count.txid);
         if count.txid == txid {
+            msg!("Found matching txid, updating count and timestamp");
             count.count += 1;
             count.last_updated = current_timestamp_u64;
             found = true;
@@ -186,23 +200,35 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
         }
     }
 
+    // If the txid was not found, add a new entry
     if !found {
+        msg!("txid not found, adding new entry");
         state.txid_submission_counts.push(TxidSubmissionCount {
             txid: txid.to_string(),
             count: 1,
             last_updated: current_timestamp_u64,
         });
+    } else {
+        msg!("txid found and updated");
     }
 
+    msg!("update_submission_count: Exiting");
     Ok(())
 }
 
+
 pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
+    msg!("Function: submit_data_report_helper");
+    msg!("Params: txid={}, report={:?}", txid, report);
+
     let contributor_key = ctx.accounts.user.key();
+    msg!("contributor_key: {}", contributor_key);
+
     let state = &mut ctx.accounts.oracle_contract_state;
     let report_account = &mut ctx.accounts.report_account;
 
     if report.contributor_reward_address != contributor_key {
+        msg!("Error: Contributor Key Mismatch");
         return Err(OracleError::ContributorKeyMismatch.into());
     }
 
@@ -210,12 +236,17 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
 
     let mut contributor_compliance_score = 0;
     let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
+    msg!("Current timestamp: {}", current_timestamp);
+
     let contributor_registered = state.contributors.iter().any(|c| {
         if c.reward_address == contributor_key {
+            msg!("Found contributor: {}", contributor_key);
             if c.calculate_is_banned(current_timestamp) {
+                msg!("Contributor is banned");
                 return false;
             }
             contributor_compliance_score = c.compliance_score;
+            msg!("Contributor compliance score: {}", contributor_compliance_score);
             true
         } else {
             false
@@ -223,19 +254,24 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
     });
 
     if !contributor_registered {
+        msg!("Error: Contributor Not Registered Or Banned");
         return Err(OracleError::ContributorNotRegisteredOrBanned.into());
     }
 
     if !report_account.report.txid.is_empty() && report_account.report.txid != txid {
+        msg!("Error: Report Reinitialization Detected");
         return Err(OracleError::ReportReinitializationDetected.into());
     }
 
     let report_clone = report.clone();
     report_account.report = report;
+    msg!("Report stored in report account");
+
 
     update_submission_count(state, &txid)?;
 
     let weight = normalize_compliance_score(contributor_compliance_score);
+    msg!("Normalized weight: {}", weight);
 
     // Emit an event after storing the report
     emit!(DataReportSubmitted {
@@ -279,9 +315,10 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
     }
 
     cleanup_old_submission_counts(state)?;
-
+    msg!("submit_data_report_helper: Exiting");
     Ok(())
 }
+
 #[derive(Accounts)]
 #[instruction(txid: String)]
 pub struct HandleConsensus<'info> {
@@ -985,39 +1022,64 @@ fn calculate_consensus_and_cleanup(
     Ok(())
 }
 
-
 // Function to handle the submission of Pastel transaction status reports
 fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()> {
+    msg!("validate_data_contributor_report: Entry");
+    msg!("report: {:?}", report); // Assuming Debug is implemented for PastelTxStatusReport
+
     // Validate the TXID is non-empty
     if report.txid.trim().is_empty() {
+        msg!("Error: InvalidTxid (TXID is empty)");
         return Err(OracleError::InvalidTxid.into());
+    } else {
+        msg!("TXID is valid and non-empty");
     }
+
     // Validate TXID status
     match report.txid_status {
-        TxidStatus::MinedActivated | TxidStatus::MinedPendingActivation | TxidStatus::PendingMining | TxidStatus::Invalid => {},
+        TxidStatus::MinedActivated | 
+        TxidStatus::MinedPendingActivation | 
+        TxidStatus::PendingMining | 
+        TxidStatus::Invalid => {
+            msg!("TXID status is valid");
+        }
+        // No need for a default case as all enum variants are covered
     }
     
     // Validate the Pastel ticket type is present and valid
-    if report.pastel_ticket_type.is_none() {
+    if let Some(pastel_ticket_type) = report.pastel_ticket_type {
+        msg!("Pastel ticket type is present: {:?}", pastel_ticket_type);
+    } else {
+        msg!("Error: Missing Pastel Ticket Type");
         return Err(OracleError::MissingPastelTicketType.into());
     }
+
     // Validate the SHA3-256 hash of the corresponding file
     if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
         if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            msg!("Error: Invalid File Hash Length or Non-hex characters");
             return Err(OracleError::InvalidFileHashLength.into());
+        } else {
+            msg!("SHA3-256 hash of corresponding file is valid");
         }
     } else {
+        msg!("Error: Missing File Hash");
         return Err(OracleError::MissingFileHash.into());
     }
+
     // Validate the timestamp
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    msg!("Current timestamp: {}", current_timestamp);
     if report.timestamp > current_timestamp {
+        msg!("Error: Invalid Timestamp (report timestamp is in the future)");
         return Err(OracleError::InvalidTimestamp.into());
+    } else {
+        msg!("Timestamp is valid");
     }
-    
+
+    msg!("validate_data_contributor_report: Exiting");
     Ok(())
 }
-
 
 impl OracleContractState {
 
@@ -1259,6 +1321,10 @@ pub mod solana_pastel_oracle_program {
         timestamp: u64, 
         contributor_reward_address: Pubkey
     ) -> ProgramResult {
+        msg!("Function: submit_data_report");
+        msg!("Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, timestamp={}, contributor_addr={}",
+            txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, timestamp, contributor_reward_address);
+    
         // Convert the txid_status from string to enum
         let txid_status = match txid_status_str.as_str() {
             "Invalid" => TxidStatus::Invalid,
@@ -1288,7 +1354,8 @@ pub mod solana_pastel_oracle_program {
     
         msg!("Creating report with txid: {}", txid);
         msg!("Timestamp: {}", timestamp);
-    
+        
+        msg!("Report created, calling submit_data_report_helper");
         submit_data_report_helper(ctx, txid, report)
 
     }
