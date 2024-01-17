@@ -116,6 +116,7 @@ describe('Contributor Registration', () => {
       [Buffer.from("reward_pool")],
       program.programId
     );
+
     const [feeReceivingContractAccountPDA] = await web3.PublicKey.findProgramAddressSync(
       [Buffer.from("fee_receiving_contract")],
       program.programId
@@ -144,9 +145,12 @@ describe('Contributor Registration', () => {
       .signers([testContributor])
       .rpc();
 
+    console.log('Contributor registered successfully with the address:', testContributor.publicKey.toBase58());
+
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
 
     const contributors = state.contributors as { rewardAddress: web3.PublicKey }[];
+    console.log('Contributors from contract state:', contributors);
     const registeredContributor = contributors.find(c => c.rewardAddress.equals(testContributor.publicKey));
     assert.exists(registeredContributor, 'Contributor should be registered');
   });
@@ -162,18 +166,18 @@ describe('TXID Monitoring', () => {
     const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
     const expectedAmountStr = expectedAmountLamports.toString();
 
-    // Concatenate "pending_payment", txidToAdd, and the byte array of admin's public key
-    const preimage = Buffer.concat([
-      Buffer.from("pending_payment"),
-      Buffer.from(txidToAdd),
-      admin.publicKey.toBuffer()  // This gets the raw byte array of the public key
-    ]);
+    // Concatenate "pending_payment", txidToAdd, and the Base58 string of admin's public key
+    const preimageString = "pending_payment" + txidToAdd + admin.publicKey.toBase58();
+    console.log('Preimage String:', preimageString);
 
-    const seedHash = crypto.createHash('sha256').update(preimage).digest();
+    // Convert the concatenated string to bytes using UTF-8 encoding
+    const preimageBytes = Buffer.from(preimageString, 'utf8');
 
-    // Find the PDA for pendingPaymentAccount using the hashed seed (first 32 bytes)
-    const [pendingPaymentAccountPDA, pendingPaymentAccountBump] = await web3.PublicKey.findProgramAddressSync(
-      [Uint8Array.prototype.subarray.call(seedHash, 0, 32)],
+    const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+
+    // Find the PDA for pendingPaymentAccount using the hashed seed
+    const [pendingPaymentAccountPDA, pendingPaymentAccountBump] = web3.PublicKey.findProgramAddressSync(
+      [seedHash],
       program.programId
     );
 
@@ -211,53 +215,70 @@ describe('TXID Monitoring', () => {
 
 describe('Data Report Submission', () => {
   it('Submits a data report for a monitored TXID', async () => {
+    // Define the amount of SOL to transfer (in SOL, not lamports)
+    const transferAmountSOL = 0.1; // example amount
+
+    // Create a transfer transaction
+    const transferTransaction = new anchor.web3.Transaction().add(
+      anchor.web3.SystemProgram.transfer({
+        fromPubkey: admin.publicKey,
+        toPubkey: testContributor.publicKey,
+        lamports: transferAmountSOL * anchor.web3.LAMPORTS_PER_SOL,
+      })
+    );
+
+    // Sign and send the transaction
+    await provider.sendAndConfirm(transferTransaction);
+    console.log(`Transferred ${transferAmountSOL} SOL to testContributor account with address ${testContributor.publicKey.toBase58()}`);
+
     // Setup
+    const seedPreamble = "pastel_tx_status_report";
     const txidToReport = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
+    const rewardAddress = testContributor.publicKey; 
+
+    console.log('Seed Preamble:', seedPreamble);
     console.log('TXID to Report:', txidToReport);
+    console.log('Contributor Address:', rewardAddress.toBase58());
 
-    // Enum mappings
-    const TxidStatusEnum = {
-      Invalid: 0,
-      PendingMining: 1,
-      MinedPendingActivation: 2,
-      MinedActivated: 3
-    };
+    // Concatenate strings
+    const preimageString = seedPreamble + txidToReport + rewardAddress.toBase58();
 
-    const PastelTicketTypeEnum = {
-      Sense: 0,
-      Cascade: 1,
-      Nft: 2,
-      InferenceApi: 3
-    };
+    console.log('Preimage String:', preimageString);
 
-    // Convert to numeric representations
-    const txidStatusValue = TxidStatusEnum['MinedActivated']; // Assuming 'MinedActivated' corresponds to 3
-    const pastelTicketTypeValue = PastelTicketTypeEnum['Nft']; // Assuming 'Nft' corresponds to 2
-    console.log(`TXID Status Value: ${txidStatusValue}, Pastel Ticket Type Value: ${pastelTicketTypeValue}`);
+    // Convert the concatenated string to bytes using UTF-8 encoding
+    const preimageBytes = Buffer.from(preimageString, 'utf8');
 
-    const timestamp = new BN(Date.now() / 1000);
+    const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
 
-    console.log('String Seed:', Buffer.from("pastel_tx_status_report").toString('hex'));
-    console.log('TXID:', txidToReport);
-    console.log('Public Key:', testContributor.publicKey.toBuffer().toString('hex'));
-
-        // Concatenate the bytes
-    const preimage = Buffer.concat([
-      Buffer.from("pastel_tx_status_report"),
-      Buffer.from(txidToReport),
-      testContributor.publicKey.toBuffer()
-    ]);
-
-    // Compute hash of the preimage
-    const seedHash = crypto.createHash('sha256').update(preimage).digest();
     console.log('Seed Hash:', seedHash.toString('hex'));
 
-    // Use the first 32 bytes of the hash as the seed
-    const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync(
+    // Find the PDA for pendingPaymentAccount using the hashed seed
+    const [reportAccountPDA, reportAccountPDABump] = web3.PublicKey.findProgramAddressSync(
       [seedHash],
       program.programId
     );
     console.log('Report Account PDA:', reportAccountPDA.toString());
+
+    // Enum mappings (as strings)
+    const TxidStatusEnum = {
+      Invalid: "Invalid",
+      PendingMining: "PendingMining",
+      MinedPendingActivation: "MinedPendingActivation",
+      MinedActivated: "MinedActivated"
+    };
+
+    const PastelTicketTypeEnum = {
+      Sense: "Sense",
+      Cascade: "Cascade",
+      Nft: "Nft",
+      InferenceApi: "InferenceApi"
+    };
+
+    // Use the string representations
+    const txidStatusValue = TxidStatusEnum.MinedActivated;
+    const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
+    console.log(`TXID Status Value: ${txidStatusValue}, Pastel Ticket Type Value: ${pastelTicketTypeValue}`);
+    const timestamp = new BN(Math.floor(Date.now() / 1000)); // Ensure the timestamp is in seconds and is a BigNumber
 
     // Submit the data report
     await program.methods.submitDataReport(
@@ -281,6 +302,7 @@ describe('Data Report Submission', () => {
     // Fetch the updated state
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
     
+    console.log('Oracle Contract State:', state);
     // Verification
     // Fetch the updated state of the report account
     const reportAccount = await program.account.pastelTxStatusReportAccount.fetch(reportAccountPDA);

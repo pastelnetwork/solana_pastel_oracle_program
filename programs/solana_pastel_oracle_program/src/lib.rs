@@ -3,7 +3,6 @@ use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
-
 use std::cmp;
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
@@ -47,7 +46,17 @@ pub enum OracleError {
     InvalidAmount,
     InvalidPaymentStatus,
     InvalidTxidStatus,
-    InvalidPastelTicketType
+    InvalidPastelTicketType,
+    TxidStatusConversionError,
+    PastelTicketTypeConversionError,
+    ReportSubmissionError,
+    ContributorKeyMismatch,
+    ReportValidationFailed,
+    ContributorNotRegisteredOrBanned,
+    ReportReinitializationDetected,
+    SubmissionCountUpdateFailed,
+    ConsensusCalculationFailed,
+    CleanupFailed,        
 }
 
 impl From<OracleError> for ProgramError {
@@ -57,22 +66,19 @@ impl From<OracleError> for ProgramError {
 }
 
 pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> Hash {
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(seed_preamble.as_bytes());
-    preimage.extend_from_slice(txid.as_bytes());
-    preimage.extend_from_slice(reward_address.as_ref());
+    // Concatenate the string representations. Reward address is Base58-encoded by default.
+    let preimage_string = format!("{}{}{}", seed_preamble, txid, reward_address.to_string());
+    msg!("create_seed: generated preimage string: {}", preimage_string);
 
-    // Debugging logs
-    msg!("create_seed: generated preimage: {:?}", preimage);
+    // Convert the concatenated string to bytes
+    let preimage_bytes = preimage_string.as_bytes();
 
-    let seed_hash = hash(&preimage);
-
-    // Log the generated hash
+    // Compute hash
+    let seed_hash = hash(preimage_bytes);
     msg!("create_seed: generated seed hash: {:?}", seed_hash);
 
     seed_hash
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum TxidStatus {
@@ -82,37 +88,12 @@ pub enum TxidStatus {
     MinedActivated,
 }
 
-impl TxidStatus {
-    fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(TxidStatus::Invalid),
-            1 => Some(TxidStatus::PendingMining),
-            2 => Some(TxidStatus::MinedPendingActivation),
-            3 => Some(TxidStatus::MinedActivated),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum PastelTicketType {
     Sense,
     Cascade,
     Nft,
     InferenceApi,
-}
-
-
-impl PastelTicketType {
-    fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(PastelTicketType::Sense),
-            1 => Some(PastelTicketType::Cascade),
-            2 => Some(PastelTicketType::Nft),
-            3 => Some(PastelTicketType::InferenceApi),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
@@ -166,9 +147,9 @@ pub struct SubmitDataReport<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        seeds = [create_seed("pastel_tx_status_report", &txid, &reward_address).as_ref()],
+        seeds = [create_seed("pastel_tx_status_report", &txid, &user.key()).as_ref()],
         bump,
-        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 5) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
+        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 128) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
     )]
     pub report_account: Account<'info, PastelTxStatusReportAccount>,
 
@@ -216,21 +197,17 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
     Ok(())
 }
 
-
 pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
     let contributor_key = ctx.accounts.user.key();
     let state = &mut ctx.accounts.oracle_contract_state;
     let report_account = &mut ctx.accounts.report_account;
 
-    // Check if the contributor's key matches the report's contributor_reward_address
     if report.contributor_reward_address != contributor_key {
-        return Err(OracleError::Unauthorized.into());
+        return Err(OracleError::ContributorKeyMismatch.into());
     }
 
-    // Validate the report
     validate_data_contributor_report(&report)?;
 
-    // Check if the contributor is registered, not banned, and store compliance score
     let mut contributor_compliance_score = 0;
     let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
     let contributor_registered = state.contributors.iter().any(|c| {
@@ -246,23 +223,18 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
     });
 
     if !contributor_registered {
-        return Err(OracleError::UnregisteredOracle.into());
+        return Err(OracleError::ContributorNotRegisteredOrBanned.into());
     }
 
-    // Protect against re-initialization attack
     if report_account.report.txid != "" && report_account.report.txid != txid {
-        return Err(OracleError::InvalidOperation.into());
+        return Err(OracleError::ReportReinitializationDetected.into());
     }
 
-    // Store the report in the PastelTxStatusReportAccount PDA
-    // Clone report for later use
     let report_clone = report.clone();
     report_account.report = report;
 
-    // Update the submission count for the given txid
     update_submission_count(state, &txid)?;
 
-    // Calculate weight
     let weight = normalize_compliance_score(contributor_compliance_score);
 
     // Emit an event after storing the report
@@ -290,7 +262,7 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
         let mut new_data = AggregatedConsensusData {
             txid: txid.clone(),
             status_weights: [0; TXID_STATUS_VARIANT_COUNT],
-            hash_weights: Vec::new(), // Initialize as an empty vector
+            hash_weights: Vec::new(),
         };
         new_data.status_weights[report_clone.txid_status as usize] += weight;
         if let Some(hash) = &report_clone.first_6_characters_of_sha3_256_hash_of_corresponding_file {
@@ -302,18 +274,14 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
         state.aggregated_consensus_data.push(new_data);
     }
 
-    // Calculate consensus and cleanup if necessary
     if should_calculate_consensus(state, &txid)? {
         calculate_consensus_and_cleanup(ctx.program_id, state, &txid)?;
     }
 
-    // Cleanup old submission counts
     cleanup_old_submission_counts(state)?;
 
     Ok(())
 }
-
-
 #[derive(Accounts)]
 #[instruction(txid: String)]
 pub struct HandleConsensus<'info> {
@@ -967,7 +935,7 @@ fn calculate_consensus_and_cleanup(
         }
 
         // Use the new create_seed function to generate the seed
-        let seed = create_seed("pastel_tx_status_report", txid, &contributor.reward_address);
+        let seed = create_seed("pastel_tx_status_report", txid, &contributor.reward_address.key());
         let (pda, _bump_seed) = Pubkey::find_program_address(&[seed.as_ref()], program_id);
         
         let mut lamports = 0; // Declare lamports as mutable       
@@ -1285,14 +1253,29 @@ pub mod solana_pastel_oracle_program {
     pub fn submit_data_report(
         ctx: Context<SubmitDataReport>, 
         txid: String, 
-        txid_status: u8, 
-        pastel_ticket_type: u8, 
+        txid_status_str: String, 
+        pastel_ticket_type_str: String, 
         first_6_characters_hash: String, 
         timestamp: u64, 
         contributor_reward_address: Pubkey
-    ) -> Result<()> {
-        let txid_status = TxidStatus::from_u8(txid_status).ok_or(OracleError::InvalidTxidStatus)?;
-        let pastel_ticket_type = PastelTicketType::from_u8(pastel_ticket_type).ok_or(OracleError::InvalidPastelTicketType)?;
+    ) -> ProgramResult {
+        // Convert the txid_status from string to enum
+        let txid_status = match txid_status_str.as_str() {
+            "Invalid" => TxidStatus::Invalid,
+            "PendingMining" => TxidStatus::PendingMining,
+            "MinedPendingActivation" => TxidStatus::MinedPendingActivation,
+            "MinedActivated" => TxidStatus::MinedActivated,
+            _ => return Err(ProgramError::from(OracleError::InvalidTxidStatus))
+        };
+    
+        // Convert the pastel_ticket_type from string to enum
+        let pastel_ticket_type = match pastel_ticket_type_str.as_str() {
+            "Sense" => PastelTicketType::Sense,
+            "Cascade" => PastelTicketType::Cascade,
+            "Nft" => PastelTicketType::Nft,
+            "InferenceApi" => PastelTicketType::InferenceApi,
+            _ => return Err(ProgramError::from(OracleError::InvalidPastelTicketType))
+        };
     
         let report = PastelTxStatusReport {
             txid: txid.clone(),
@@ -1303,9 +1286,13 @@ pub mod solana_pastel_oracle_program {
             contributor_reward_address,
         };
     
-        submit_data_report_helper(ctx, txid, report).map_err(|e| e.into())
-    }
+        msg!("Creating report with txid: {}", txid);
+        msg!("Timestamp: {}", timestamp);
+    
+        submit_data_report_helper(ctx, txid, report)
 
+    }
+    
     pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
         request_reward_helper(ctx, contributor_address)
     }
