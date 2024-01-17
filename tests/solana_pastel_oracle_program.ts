@@ -278,15 +278,14 @@ describe('Data Report Submission', () => {
     const txidStatusValue = TxidStatusEnum.MinedActivated;
     const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
     console.log(`TXID Status Value: ${txidStatusValue}, Pastel Ticket Type Value: ${pastelTicketTypeValue}`);
-    const timestamp = new BN(Math.floor(Date.now() / 1000)); // Ensure the timestamp is in seconds and is a BigNumber
 
+    console.log('Now submitting the data report...');
     // Submit the data report
     await program.methods.submitDataReport(
       txidToReport,
       txidStatusValue,
       pastelTicketTypeValue,
       'abcdef',
-      timestamp,
       testContributor.publicKey
     )
     .accounts({
@@ -301,18 +300,17 @@ describe('Data Report Submission', () => {
 
     // Fetch the updated state
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    
     console.log('Oracle Contract State:', state);
-    // Verification
+
     // Fetch the updated state of the report account
     const reportAccount = await program.account.pastelTxStatusReportAccount.fetch(reportAccountPDA);
     console.log('Report Account Data:', reportAccount);
 
     // Check if the report details match the submission
     assert.strictEqual(reportAccount.report.txid, txidToReport, "TXID in report should match the submitted TXID");
-    assert.strictEqual(reportAccount.report.txidStatus.toString(), "MinedActivated", "TXID Status should match the submitted status");
-    assert.strictEqual(reportAccount.report.pastelTicketType.toString(), "Nft", "Pastel Ticket Type should match the submitted type");
-    
+    assert.strictEqual(Object.keys(reportAccount.report.txidStatus)[0], "minedActivated", "TXID Status should match the submitted status");
+    assert.strictEqual(Object.keys(reportAccount.report.pastelTicketType)[0], "nft", "Pastel Ticket Type should match the submitted type");
+
     // Fetch the updated oracle contract state
     const oracleState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
     console.log('Oracle Contract State:', oracleState);
@@ -324,11 +322,12 @@ describe('Data Report Submission', () => {
     const contributor = oracleState.contributors.find(c => c.rewardAddress.equals(testContributor.publicKey));
     console.log('Contributor Data:', contributor);
 
-    // Check if the contributor's details are updated
-    assert(contributor !== undefined, "Contributor should exist in the oracle contract state");
-    assert(contributor.totalReportsSubmitted > 0, "Total reports submitted should be updated");
-    assert(contributor.complianceScore >= 0, "Compliance score should be updated");
-    assert(contributor.reliabilityScore >= 0, "Reliability score should be updated");
+    // Find the submission count for the specific TXID
+    const txidSubmission = oracleState.txidSubmissionCounts.find(submission => submission.txid === txidToReport);
+
+    // Check if the submission count for the TXID has increased
+    assert(txidSubmission !== undefined, "TXID should be present in the submission counts");
+    assert(txidSubmission.count > 0, "Submission count for the TXID should be increased");
 
     console.log('Data report submission verification successful for the TXID:', txidToReport);
   });

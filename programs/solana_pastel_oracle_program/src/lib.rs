@@ -172,27 +172,18 @@ pub struct DataReportSubmitted {
 
 // Function to update the submission count for a given txid
 fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
-    msg!("update_submission_count: Entry");
-    msg!("txid: {}", txid);
-
     // Get the current timestamp
     let current_timestamp = Clock::get()?.unix_timestamp;
-    msg!("Current timestamp (before conversion): {}", current_timestamp);
-
     // Convert the timestamp to u64
     let current_timestamp_u64 = current_timestamp.try_into().map_err(|_| {
-        msg!("Error: Invalid timestamp conversion");
         OracleError::InvalidTimestamp
     })?;
-    msg!("Current timestamp (u64): {}", current_timestamp_u64);
 
     let mut found = false;
 
     // Iterate through txid submission counts
     for count in &mut state.txid_submission_counts {
-        msg!("Checking txid: {}", count.txid);
         if count.txid == txid {
-            msg!("Found matching txid, updating count and timestamp");
             count.count += 1;
             count.last_updated = current_timestamp_u64;
             found = true;
@@ -202,17 +193,13 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
 
     // If the txid was not found, add a new entry
     if !found {
-        msg!("txid not found, adding new entry");
         state.txid_submission_counts.push(TxidSubmissionCount {
             txid: txid.to_string(),
             count: 1,
             last_updated: current_timestamp_u64,
         });
     } else {
-        msg!("txid found and updated");
     }
-
-    msg!("update_submission_count: Exiting");
     Ok(())
 }
 
@@ -220,15 +207,12 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
 pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
     msg!("Function: submit_data_report_helper");
     msg!("Params: txid={}, report={:?}", txid, report);
-
     let contributor_key = ctx.accounts.user.key();
-    msg!("contributor_key: {}", contributor_key);
 
     let state = &mut ctx.accounts.oracle_contract_state;
     let report_account = &mut ctx.accounts.report_account;
 
     if report.contributor_reward_address != contributor_key {
-        msg!("Error: Contributor Key Mismatch");
         return Err(OracleError::ContributorKeyMismatch.into());
     }
 
@@ -236,17 +220,13 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
 
     let mut contributor_compliance_score = 0;
     let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
-    msg!("Current timestamp: {}", current_timestamp);
 
     let contributor_registered = state.contributors.iter().any(|c| {
         if c.reward_address == contributor_key {
-            msg!("Found contributor: {}", contributor_key);
             if c.calculate_is_banned(current_timestamp) {
-                msg!("Contributor is banned");
                 return false;
             }
             contributor_compliance_score = c.compliance_score;
-            msg!("Contributor compliance score: {}", contributor_compliance_score);
             true
         } else {
             false
@@ -254,24 +234,19 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
     });
 
     if !contributor_registered {
-        msg!("Error: Contributor Not Registered Or Banned");
         return Err(OracleError::ContributorNotRegisteredOrBanned.into());
     }
 
     if !report_account.report.txid.is_empty() && report_account.report.txid != txid {
-        msg!("Error: Report Reinitialization Detected");
         return Err(OracleError::ReportReinitializationDetected.into());
     }
 
     let report_clone = report.clone();
     report_account.report = report;
-    msg!("Report stored in report account");
-
 
     update_submission_count(state, &txid)?;
 
     let weight = normalize_compliance_score(contributor_compliance_score);
-    msg!("Normalized weight: {}", weight);
 
     // Emit an event after storing the report
     emit!(DataReportSubmitted {
@@ -315,7 +290,6 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
     }
 
     cleanup_old_submission_counts(state)?;
-    msg!("submit_data_report_helper: Exiting");
     Ok(())
 }
 
@@ -367,13 +341,11 @@ pub fn add_pending_payment_helper(
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
     if !pending_payment_account.pending_payment.txid.is_empty() && pending_payment_account.pending_payment.txid != txid {
-        msg!("Attempted to re-initialize an already initialized pending payment account.");
         return Err(OracleError::InvalidOperation.into());
     }
 
     // Ensure txid is correct and other fields are properly set
     if pending_payment.txid != txid {
-        msg!("TXID mismatch in pending payment initialization.");
         return Err(OracleError::InvalidTxid.into());
     }
 
@@ -1311,19 +1283,16 @@ pub mod solana_pastel_oracle_program {
     pub fn process_payment(ctx: Context<ProcessPayment>, txid: String, amount: u64) -> Result<()> {
         process_payment_helper(ctx, txid, amount)
     }
-
     pub fn submit_data_report(
         ctx: Context<SubmitDataReport>, 
         txid: String, 
         txid_status_str: String, 
         pastel_ticket_type_str: String, 
         first_6_characters_hash: String, 
-        timestamp: u64, 
         contributor_reward_address: Pubkey
     ) -> ProgramResult {
-        msg!("Function: submit_data_report");
-        msg!("Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, timestamp={}, contributor_addr={}",
-            txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, timestamp, contributor_reward_address);
+        msg!("Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, contributor_addr={}",
+            txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, contributor_reward_address);
     
         // Convert the txid_status from string to enum
         let txid_status = match txid_status_str.as_str() {
@@ -1343,6 +1312,9 @@ pub mod solana_pastel_oracle_program {
             _ => return Err(ProgramError::from(OracleError::InvalidPastelTicketType))
         };
     
+        // Fetch current timestamp from Solana's clock
+        let timestamp = Clock::get()?.unix_timestamp as u64;
+    
         let report = PastelTxStatusReport {
             txid: txid.clone(),
             txid_status,
@@ -1351,13 +1323,7 @@ pub mod solana_pastel_oracle_program {
             timestamp,
             contributor_reward_address,
         };
-    
-        msg!("Creating report with txid: {}", txid);
-        msg!("Timestamp: {}", timestamp);
-        
-        msg!("Report created, calling submit_data_report_helper");
         submit_data_report_helper(ctx, txid, report)
-
     }
     
     pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
