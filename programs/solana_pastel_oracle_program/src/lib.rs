@@ -29,34 +29,24 @@ pub enum OracleError {
     UnregisteredOracle,
     InvalidTxid,
     InvalidFileHashLength,
-    SubmissionCountExceeded,
     MissingPastelTicketType,
     MissingFileHash,
-    InvalidTimestamp,
     RegistrationFeeNotPaid,
     NotEligibleForReward,
     NotBridgeContractAddress,
     InsufficientFunds,
-    Unauthorized,
+    UnauthorizedWithdrawalAccount,
     InvalidPaymentAmount,
     PaymentNotFound,
-    InvalidOperation,
-    IncorrectAdminKey,
+    PendingPaymentAlreadyInitialized,
     AccountAlreadyInitialized,
-    InvalidAmount,
+    PendingPaymentInvalidAmount,
     InvalidPaymentStatus,
     InvalidTxidStatus,
     InvalidPastelTicketType,
-    TxidStatusConversionError,
-    PastelTicketTypeConversionError,
-    ReportSubmissionError,
-    ContributorKeyMismatch,
-    ReportValidationFailed,
     ContributorNotRegisteredOrBanned,
     ReportReinitializationDetected,
-    SubmissionCountUpdateFailed,
-    ConsensusCalculationFailed,
-    CleanupFailed,        
+    ReportAccountNotWritable,
 }
 
 impl From<OracleError> for ProgramError {
@@ -69,14 +59,11 @@ pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> 
     // Concatenate the string representations. Reward address is Base58-encoded by default.
     let preimage_string = format!("{}{}{}", seed_preamble, txid, reward_address);
     msg!("create_seed: generated preimage string: {}", preimage_string);
-
     // Convert the concatenated string to bytes
     let preimage_bytes = preimage_string.as_bytes();
-
     // Compute hash
     let seed_hash = hash(preimage_bytes);
     msg!("create_seed: generated seed hash: {:?}", seed_hash);
-
     seed_hash
 }
 
@@ -192,48 +179,57 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
     Ok(())
 }
 
-pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, report: PastelTxStatusReport) -> ProgramResult {
-    let contributor_key = ctx.accounts.user.key();
+pub fn get_report_account_pda(
+    program_id: &Pubkey, 
+    txid: &str, 
+    contributor_reward_address: &Pubkey
+) -> (Pubkey, u8) {
+    msg!("get_report_account_pda: program_id: {}, txid: {}, contributor_reward_address: {}", program_id, txid, contributor_reward_address);
+    let seed_hash = create_seed("pastel_tx_status_report", txid, contributor_reward_address);
+    msg!("get_report_account_pda: seed_hash: {:?}", seed_hash);
+    Pubkey::find_program_address(&[seed_hash.as_ref()], program_id)
+}
+
+
+pub fn submit_data_report_helper(
+    ctx: Context<SubmitDataReport>, 
+    txid: String, 
+    report: PastelTxStatusReport,
+    contributor_reward_address: Pubkey
+) -> ProgramResult {
     let state = &mut ctx.accounts.oracle_contract_state;
-    let report_account = &mut ctx.accounts.report_account;
-
-    if report.contributor_reward_address != contributor_key {
-        return Err(OracleError::ContributorKeyMismatch.into());
-    }
-
+    
     validate_data_contributor_report(&report)?;
 
-    let current_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| OracleError::InvalidTimestamp)?;
-    let mut contributor_compliance_score = 0;
-    let mut is_registered = false;
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    for contributor in &state.contributors {
-        if contributor.reward_address == contributor_key {
-            contributor_compliance_score = contributor.compliance_score;
-            is_registered = !contributor.calculate_is_banned(current_timestamp);
-            break;
-        }
-    }
+    // Temporarily store necessary data from state
+    let (compliance_score, is_banned) = if let Some(contributor) = state.contributors.iter().find(|c| c.reward_address == contributor_reward_address) {
+        (contributor.compliance_score, contributor.calculate_is_banned(current_timestamp))
+    } else {
+        return Err(OracleError::ContributorNotRegisteredOrBanned.into());
+    };
 
-    if !is_registered {
+    // Early return if the contributor is banned
+    if is_banned {
         return Err(OracleError::ContributorNotRegisteredOrBanned.into());
     }
 
-    if !report_account.report.txid.is_empty() && report_account.report.txid != txid {
+    if !ctx.accounts.report_account.report.txid.is_empty() && ctx.accounts.report_account.report.txid != txid {
         return Err(OracleError::ReportReinitializationDetected.into());
     }
 
-    report_account.report = report.clone();
+    ctx.accounts.report_account.report = report.clone();
     update_submission_count(state, &txid)?;
 
-    let weight = normalize_compliance_score(contributor_compliance_score) as u32; // Safely convert i32 to u32
+    let weight = normalize_compliance_score(compliance_score) as u32;
     aggregate_consensus_data(state, &report, weight, &txid)?;
-
     if should_calculate_consensus(state, &txid)? {
-        calculate_consensus_and_cleanup(ctx.program_id, state, &txid)?;
+        calculate_consensus_and_cleanup(ctx.program_id, &ctx.remaining_accounts, state, &txid)?;
     }
 
     cleanup_old_submission_counts(state)?;
+    
     Ok(())
 }
 
@@ -319,7 +315,7 @@ pub fn add_pending_payment_helper(
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
     if !pending_payment_account.pending_payment.txid.is_empty() && pending_payment_account.pending_payment.txid != txid {
-        return Err(OracleError::InvalidOperation.into());
+        return Err(OracleError::PendingPaymentAlreadyInitialized.into());
     }
 
     // Ensure txid is correct and other fields are properly set
@@ -921,95 +917,73 @@ pub struct ConsensusReachedEvent {
     pub number_of_contributors_included: u32,
 }
 
+
 fn calculate_consensus_and_cleanup(
     program_id: &Pubkey,
+    accounts: &[AccountInfo],
     state: &mut OracleContractState, 
-    txid: &str
+    txid: &str,
 ) -> Result<()> {
     let aggregated_data = state.aggregated_consensus_data.iter()
         .find(|data| data.txid == txid)
         .ok_or(OracleError::InvalidTxid)?;
+    msg!("Aggregated Data Found for TXID: {}", txid);
 
-    msg!("Aggregated Data Found for TXID: {}", txid);        
-    
-    // Efficient consensus calculation
     let max_weight = aggregated_data.status_weights.iter().max().unwrap_or(&0);
     let consensus_status_index = aggregated_data.status_weights.iter().position(|&w| w == *max_weight).unwrap_or(0);
     let consensus_status = usize_to_txid_status(consensus_status_index).unwrap_or(TxidStatus::Invalid);
     msg!("Consensus Status: {:?}, Max Weight: {}", consensus_status, max_weight);
 
-    // Finding the hash with the highest weight
     let consensus_hash = aggregated_data.hash_weights.iter()
         .max_by_key(|hash_weight| hash_weight.weight)
         .map(|hash_weight| hash_weight.hash.clone())
         .unwrap_or_default();
     msg!("Consensus Hash: {}", consensus_hash);
 
-    // Pre-calculate seeds and PDAs for contributors
-    let contributor_seeds: Vec<_> = state.contributors.iter()
-        .map(|contributor| create_seed("pastel_tx_status_report", txid, &contributor.reward_address.key()))
-        .collect();
-    msg!("Contributor Seeds Prepared");        
-
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
     let mut contributor_count = 0;
 
-    for (contributor, seed) in state.contributors.iter_mut().zip(contributor_seeds.iter()) {
-        if contributor.ban_expiry > current_timestamp {
-            msg!("Contributor {} is banned, skipping", contributor.reward_address);
-            continue;
-        }
+    for contributor in state.contributors.iter_mut().filter(|c| c.ban_expiry <= current_timestamp) {
+        msg!("Checking submission from Contributor: {}", contributor.reward_address);
 
-        let (pda, _bump_seed) = Pubkey::find_program_address(&[seed.as_ref()], program_id);
-        msg!("PDA Calculated: {}", pda);
-
-        let mut lamports = 0;
-        let mut data = vec![];
-        let report_account_info = AccountInfo::new(
-            &pda, false, true, &mut lamports, &mut data, program_id, false, 0
-        );
-
-        if let Ok(report_account) = Account::<PastelTxStatusReportAccount>::try_from(&report_account_info) {
-            let report = &report_account.report;
-            let is_accurate_status = report.txid_status == consensus_status;
-            msg!("Comparing txid_status: Report: {:?}, Consensus: {:?}", report.txid_status, consensus_status);
-            
-            let is_accurate_hash: bool = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref()
-                .map_or(false, |hash| {
-                    let hash_comparison = hash == &consensus_hash;
-                    msg!("Comparing Hash: Report: {}, Consensus: {}, Result: {}", hash, consensus_hash, hash_comparison);
-                    hash_comparison
-                });
-            
-            let is_accurate = is_accurate_status && is_accurate_hash;
-            msg!("Final Accuracy Determination: Status: {}, Hash: {}, Overall: {}", is_accurate_status, is_accurate_hash, is_accurate);
-
-            if is_accurate || is_accurate_hash {
-                msg!("Contributor {} is accurate, updating activity and compliance", contributor.reward_address);
-                contributor_count += 1;
+        let (pda, _bump_seed) = get_report_account_pda(program_id, txid, &contributor.reward_address);
+        if let Some(report_account_info) = accounts.iter().find(|&account| *account.key == pda) {
+            if !report_account_info.is_writable || *report_account_info.owner != *program_id {
+                return Err(OracleError::ReportAccountNotWritable.into());
             }
 
-            update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
+            if let Ok(report_account) = PastelTxStatusReportAccount::try_from_slice(&report_account_info.data.borrow()) {
+                if report_account.report.txid == txid {
+                    let is_accurate = report_account.report.txid_status == consensus_status &&
+                                    report_account.report.first_6_characters_of_sha3_256_hash_of_corresponding_file
+                                        .as_ref()
+                                        .map_or(false, |hash| hash == &consensus_hash);
+                    if is_accurate {
+                        contributor_count += 1;
+                    }
+                    update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
+                }
+            } else {
+                return Err(OracleError::InvalidTxid.into());
+            }
         }
     }
-    msg!("Consensus Reached for Pastel TXID: {}, Status: {:?}, Hash: {}, Number of Contributors: {}", txid, consensus_status, consensus_hash, contributor_count);
+
+    msg!("Consensus Reached: TXID: {}, Status: {:?}, Hash: {}, Contributors: {}", txid, consensus_status, consensus_hash, contributor_count);
 
     emit!(ConsensusReachedEvent {
         txid: txid.to_string(),
         status: format!("{:?}", consensus_status),
         hash: consensus_hash,
-        number_of_contributors_included: contributor_count,
+        number_of_contributors_included: contributor_count as u32,
     });
 
     state.assess_and_apply_bans(current_timestamp);
-
-    // Cleanup logic to retain only recent consensus data
-    state.aggregated_consensus_data.retain(|data| {
-        current_timestamp - data.last_updated < DATA_RETENTION_PERIOD
-    });
+    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
 
     Ok(())
 }
+
 
 // Function to handle the submission of Pastel transaction status reports
 fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()> {
@@ -1018,18 +992,15 @@ fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()>
         msg!("Error: InvalidTxid (TXID is empty)");
         return Err(OracleError::InvalidTxid.into());
     } 
-
     // Simplified TXID status validation
     if !matches!(report.txid_status, TxidStatus::MinedActivated | TxidStatus::MinedPendingActivation | TxidStatus::PendingMining | TxidStatus::Invalid) {
         return Err(OracleError::InvalidTxidStatus.into());
     }
-
     // Direct return in case of missing data, reducing nested if conditions
     if report.pastel_ticket_type.is_none() {
         msg!("Error: Missing Pastel Ticket Type");
         return Err(OracleError::MissingPastelTicketType.into());
     }
-
     // Direct return in case of invalid hash, reducing nested if conditions
     if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
         if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1039,12 +1010,11 @@ fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()>
     } else {
         return Err(OracleError::MissingFileHash.into());
     }
-
     Ok(())
 }
 
-impl OracleContractState {
 
+impl OracleContractState {
     pub fn assess_and_apply_bans(&mut self, current_time: u64) {
         for contributor in &mut self.contributors {
             contributor.handle_consensus_failure(current_time);
@@ -1054,7 +1024,6 @@ impl OracleContractState {
 }
 
 impl Contributor {
-
     // Method to handle consensus failure
     pub fn handle_consensus_failure(&mut self, current_time: u64) {
         self.consensus_failures += 1;
@@ -1067,7 +1036,6 @@ impl Contributor {
         }
         msg!("Contributor Ban Update: Address: {}, Ban Expiry: {}", self.reward_address, self.ban_expiry);
     }
-
     // Method to check if the contributor is recently active
     fn calculate_is_recently_active(&self, last_txid_request_time: u64) -> bool {
         // Define a threshold for recent activity (e.g., active within the last 24 hours)
@@ -1080,7 +1048,6 @@ impl Contributor {
         last_active_timestamp_i64 >= last_txid_request_time as i64 &&
             Clock::get().unwrap().unix_timestamp - last_active_timestamp_i64 < recent_activity_threshold as i64
     }
-
     // Method to check if the contributor is reliable
     fn calculate_is_reliable(&self) -> bool {
         // Define what makes a contributor reliable; for example, a high reliability score which is a ratio of accurate reports to total reports
@@ -1090,12 +1057,10 @@ impl Contributor {
         let reliability_ratio = self.accurate_reports_count as f32 / self.total_reports_submitted as f32;
         reliability_ratio >= 0.8 // Example threshold for reliability, e.g., 80% accuracy
     }    
-
     // Check if the contributor is currently banned
     pub fn calculate_is_banned(&self, current_time: u64) -> bool {
         current_time < self.ban_expiry
     }
-
     // Method to determine if the contributor is eligible for rewards
     pub fn calculate_is_eligible_for_rewards(&self) -> bool {
         self.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
@@ -1104,6 +1069,7 @@ impl Contributor {
     }
 
 }
+
 
 #[derive(Accounts)]
 pub struct SetBridgeContract<'info> {
@@ -1120,7 +1086,6 @@ impl<'info> SetBridgeContract<'info> {
         Ok(())
     }
 }
-
 
 #[derive(Accounts)]
 #[instruction(txid: String)] // Include txid as part of the instruction
@@ -1172,7 +1137,7 @@ pub fn process_payment_helper(
 pub struct WithdrawFunds<'info> {
     #[account(
         mut,
-        constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ OracleError::Unauthorized
+        constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ OracleError::UnauthorizedWithdrawalAccount,
     )]
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
@@ -1189,7 +1154,7 @@ pub struct WithdrawFunds<'info> {
 impl<'info> WithdrawFunds<'info> {
     pub fn execute(ctx: Context<WithdrawFunds>, reward_pool_amount: u64, fee_receiving_amount: u64) -> Result<()> {
         if !ctx.accounts.admin_account.is_signer {
-            return Err(OracleError::Unauthorized.into()); // Check if the admin_account is a signer
+            return Err(OracleError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account is a signer
         } 
         let admin_account = &mut ctx.accounts.admin_account;
         let reward_pool_account = &mut ctx.accounts.reward_pool_account;
@@ -1247,7 +1212,7 @@ pub mod solana_pastel_oracle_program {
 
     pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, expected_amount_str: String, payment_status_str: String) -> Result<()> {
         let expected_amount = expected_amount_str.parse::<u64>()
-            .map_err(|_| OracleError::InvalidAmount)?;
+            .map_err(|_| OracleError::PendingPaymentInvalidAmount)?;
     
         // Convert the payment status from string to enum
         let payment_status = match payment_status_str.as_str() {
@@ -1279,7 +1244,7 @@ pub mod solana_pastel_oracle_program {
         first_6_characters_hash: String, 
         contributor_reward_address: Pubkey
     ) -> ProgramResult {
-        msg!("Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, contributor_addr={}",
+        msg!("In `submit_data_report` function -- Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, contributor_addr={}",
             txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, contributor_reward_address);
     
         // Convert the txid_status from string to enum
@@ -1302,7 +1267,8 @@ pub mod solana_pastel_oracle_program {
     
         // Fetch current timestamp from Solana's clock
         let timestamp = Clock::get()?.unix_timestamp as u64;
-    
+
+        // Construct the report
         let report = PastelTxStatusReport {
             txid: txid.clone(),
             txid_status,
@@ -1311,7 +1277,9 @@ pub mod solana_pastel_oracle_program {
             timestamp,
             contributor_reward_address,
         };
-        submit_data_report_helper(ctx, txid, report)
+
+        // Call the helper function to submit the report
+        submit_data_report_helper(ctx, txid, report, contributor_reward_address)    
     }
     
     pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {

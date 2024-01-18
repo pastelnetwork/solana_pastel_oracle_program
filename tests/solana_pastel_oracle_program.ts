@@ -3,6 +3,7 @@ import { Program, web3, AnchorProvider, BN} from '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL} from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
 import * as crypto from 'crypto';
+import bs58 from 'bs58';
 const { ComputeBudgetProgram, Transaction } = anchor.web3;
 
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
@@ -185,6 +186,7 @@ describe('Contributor Registration', () => {
   });
 });
 
+
 describe('TXID Monitoring', () => {
   it('Adds multiple TXIDs for monitoring', async () => {
     // Define the number of TXIDs to add for monitoring
@@ -237,9 +239,10 @@ describe('TXID Monitoring', () => {
   });
 });
 
+
+
 describe('Data Report Submission', () => {
   it('Submits multiple data reports for different TXIDs with consensus and dissent', async () => {
-    // Define the monitored TXID
     const seedPreamble = "pastel_tx_status_report";
 
     // Transfer SOL to each contributor
@@ -257,91 +260,6 @@ describe('Data Report Submission', () => {
       console.log(`Transferred ${transferAmountSOL} SOL to contributor account with address ${contributor.publicKey.toBase58()}`);
     }
 
-     // Submit reports for each contributor
-    for (let i = 0; i < contributors.length; i++) {
-      const contributor = contributors[i];
-      const rewardAddress = contributor.publicKey;
-      const txidStatusValue = i < 8 ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
-      const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
-
-      const preimageString = seedPreamble + txidToAdd + rewardAddress.toBase58();
-      const preimageBytes = Buffer.from(preimageString, 'utf8');
-      const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
-      const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
-      
-      try {
-        // Create a new transaction
-        const transaction = new Transaction();
-
-        // Add instruction to increase the compute budget
-        transaction.add(ComputeBudgetProgram.setComputeUnitLimit({
-          units: 1400000 // Setting the compute budget to 1.4M CU
-        }));
-
-        // Prepare the instruction for submitDataReport
-        const submitDataReportInstruction = await program.methods.submitDataReport(
-          txidToAdd,
-          txidStatusValue,
-          pastelTicketTypeValue,
-          'abcdef',
-          contributor.publicKey
-        )
-        .accounts({
-          reportAccount: reportAccountPDA,
-          oracleContractState: oracleContractState.publicKey,
-          user: contributor.publicKey,
-          systemProgram: web3.SystemProgram.programId,
-        })
-        .signers([contributor])
-        .instruction();
-
-        // Add the submitDataReport instruction to the transaction
-        transaction.add(submitDataReportInstruction);
-
-        // Send the transaction with increased compute budget
-        await provider.sendAndConfirm(transaction, [contributor]);
-        console.log(`Data report submitted by contributor ${i + 1}`);
-      } catch (error) {
-        console.error(`Error submitting report for contributor ${i + 1}:`, error);
-        throw error; // Rethrow to fail the test
-      }
-    }
-
-    // Fetch the updated state after all submissions
-    const updatedState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    console.log('Updated Oracle Contract State:', updatedState);
-
-    // Check if the txid is in the monitored list
-    assert(updatedState.monitoredTxids.includes(txidToAdd), "TXID should be in the monitored list");
-
-    // Verify the consensus data for the TXID
-    const consensusData = updatedState.aggregatedConsensusData.find(data => data.txid === txidToAdd);
-    assert(consensusData !== undefined, "Consensus data should be present for the TXID");
-
-    // Assuming the consensus is based on the majority rule
-    const consensusStatusIndex = consensusData.statusWeights.indexOf(Math.max(...consensusData.statusWeights));
-    const consensusStatus = ['Invalid', 'PendingMining', 'MinedPendingActivation', 'MinedActivated'][consensusStatusIndex];
-    console.log('Consensus Status:', consensusStatus);
-
-    // Check if the majority consensus is achieved for 'MinedActivated'
-    assert(consensusStatus === 'MinedActivated', "Majority consensus should be 'MinedActivated'");
-
-    // Check for the hash with the highest weight (assuming this logic is in your contract)
-    const consensusHash = consensusData.hashWeights.reduce((max, h) => max.weight > h.weight ? max : h, { hash: '', weight: -1 }).hash;
-    console.log('Consensus Hash:', consensusHash);
-
-    // Add further checks if needed based on the contract's consensus logic
-
-    console.log('Data report submission verification successful for the TXID:', txidToAdd);
-
-  });
-});
-
-
-describe('Data Report Submission', () => {
-  it('Submits multiple data reports for different TXIDs with consensus and dissent', async () => {
-    const seedPreamble = "pastel_tx_status_report";
-
     // Fetch monitored TXIDs from the updated state
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
     const monitoredTxids = state.monitoredTxids;
@@ -350,6 +268,7 @@ describe('Data Report Submission', () => {
     for (const txid of monitoredTxids) {
       // Generate a random file hash for this TXID
       const randomFileHash = [...Array(6)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+      console.log(`Random file hash (first 6 characters) for TXID ${txid} generated as:`, randomFileHash);
 
       for (let i = 0; i < contributors.length; i++) {
         const contributor = contributors[i];
@@ -358,11 +277,19 @@ describe('Data Report Submission', () => {
         // Randomize the status value for each report
         const txidStatusValue = i < 8 ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
         const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
+        console.log(`Status value for TXID ${txid} by contributor ${contributor.publicKey.toBase58()} is '${txidStatusValue}'; ticket type value is '${pastelTicketTypeValue}'`);
 
         const preimageString = seedPreamble + txid + rewardAddress.toBase58();
+        console.log(`Preimage string for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, preimageString);
+
         const preimageBytes = Buffer.from(preimageString, 'utf8');
+        
         const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+        console.log(`Seed hash for PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, bs58.encode(seedHash));
+        
         const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
+        console.log(`Report account PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, reportAccountPDA.toBase58());
+
 
         // Create and send the transaction
         try {
