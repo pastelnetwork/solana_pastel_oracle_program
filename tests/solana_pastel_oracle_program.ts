@@ -3,6 +3,7 @@ import { Program, web3, AnchorProvider, BN} from '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL} from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
 import * as crypto from 'crypto';
+const { ComputeBudgetProgram, Transaction } = anchor.web3;
 
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 process.env.RUST_LOG = "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
@@ -12,6 +13,11 @@ const programID = new anchor.web3.PublicKey("AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNb
 const program = new Program<SolanaPastelOracleProgram>(IDL, programID, provider);
 const admin = provider.wallet; // Use the provider's wallet
 const oracleContractState = web3.Keypair.generate();
+const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
+const NUM_CONTRIBUTORS = 10;
+let contributors = []; // Array to store contributor keypairs
+const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
+const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 
 console.log("Program ID:", programID.toString());
 console.log("Admin ID:", admin.publicKey.toString());
@@ -106,62 +112,67 @@ describe('Set Bridge Contract', () => {
 });
 
 
-const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
-const testContributor = web3.Keypair.generate(); // Contributor Keypair used across tests
-
 describe('Contributor Registration', () => {
-  it('Registers a new data contributor', async () => {
+  it('Registers new data contributors', async () => {
+
     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
       [Buffer.from("reward_pool")],
       program.programId
     );
-
     const [feeReceivingContractAccountPDA] = await web3.PublicKey.findProgramAddressSync(
       [Buffer.from("fee_receiving_contract")],
       program.programId
     );
 
-    // Transfer the registration fee to feeReceivingContractAccount PDA
-    const transaction = new web3.Transaction().add(
-      web3.SystemProgram.transfer({
-        fromPubkey: admin.publicKey,
-        toPubkey: feeReceivingContractAccountPDA,
-        lamports: REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL,
-      })
-    );
+    for (let i = 0; i < NUM_CONTRIBUTORS; i++) {
+      // Generate a new keypair for each contributor
+      const contributor = web3.Keypair.generate();
 
-    // Sign and send the transaction
-    await provider.sendAndConfirm(transaction);
+      // Transfer the registration fee to feeReceivingContractAccount PDA
+      const transaction = new web3.Transaction().add(
+        web3.SystemProgram.transfer({
+          fromPubkey: admin.publicKey,
+          toPubkey: feeReceivingContractAccountPDA,
+          lamports: REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL,
+        })
+      );
 
-    // Call the RPC method to register the new data contributor
-    await program.methods.registerNewDataContributor()
-      .accounts({
-        oracleContractState: oracleContractState.publicKey,
-        contributorAccount: testContributor.publicKey,
-        rewardPoolAccount: rewardPoolAccountPDA,
-        feeReceivingContractAccount: feeReceivingContractAccountPDA,
-      })
-      .signers([testContributor])
-      .rpc();
+      // Sign and send the transaction
+      await provider.sendAndConfirm(transaction);
 
-    console.log('Contributor registered successfully with the address:', testContributor.publicKey.toBase58());
+      // Call the RPC method to register the new data contributor
+      await program.methods.registerNewDataContributor()
+        .accounts({
+          oracleContractState: oracleContractState.publicKey,
+          contributorAccount: contributor.publicKey,
+          rewardPoolAccount: rewardPoolAccountPDA,
+          feeReceivingContractAccount: feeReceivingContractAccountPDA,
+        })
+        .signers([contributor])
+        .rpc();
 
+      console.log(`Contributor ${i + 1} registered successfully with the address:`, contributor.publicKey.toBase58());
+      contributors.push(contributor);
+    }
+
+    // Fetch the updated state to verify all contributors are registered
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    console.log('Total number of registered contributors:', state.contributors.length);
 
-    const contributors = state.contributors as { rewardAddress: web3.PublicKey }[];
-    console.log('Contributors from contract state:', contributors);
-    const registeredContributor = contributors.find(c => c.rewardAddress.equals(testContributor.publicKey));
-    assert.exists(registeredContributor, 'Contributor should be registered');
+    // Verify each contributor is registered
+    contributors.forEach((contributor, index) => {
+      const isRegistered = state.contributors.some(c => c.rewardAddress.equals(contributor.publicKey));
+      assert.isTrue(isRegistered, `Contributor ${index + 1} should be registered`);
+    });
   });
 });
 
-const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
+
 
 describe('TXID Monitoring', () => {
   it('Adds a new TXID for monitoring', async () => {
     // Setup
-    const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
 
     const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
     const expectedAmountStr = expectedAmountLamports.toString();
@@ -214,59 +225,15 @@ describe('TXID Monitoring', () => {
 
 
 describe('Data Report Submission', () => {
-  it('Submits a data report for a monitored TXID', async () => {
-    // Define the amount of SOL to transfer (in SOL, not lamports)
-    const transferAmountSOL = 0.1; // example amount
-
-    // Create a transfer transaction
-    const transferTransaction = new anchor.web3.Transaction().add(
-      anchor.web3.SystemProgram.transfer({
-        fromPubkey: admin.publicKey,
-        toPubkey: testContributor.publicKey,
-        lamports: transferAmountSOL * anchor.web3.LAMPORTS_PER_SOL,
-      })
-    );
-
-    // Sign and send the transaction
-    await provider.sendAndConfirm(transferTransaction);
-    console.log(`Transferred ${transferAmountSOL} SOL to testContributor account with address ${testContributor.publicKey.toBase58()}`);
-
-    // Setup
+  it('Submits data reports for a monitored TXID with consensus and dissent', async () => {
+    // Define the monitored TXID
     const seedPreamble = "pastel_tx_status_report";
-    const txidToReport = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
-    const rewardAddress = testContributor.publicKey; 
-
-    console.log('Seed Preamble:', seedPreamble);
-    console.log('TXID to Report:', txidToReport);
-    console.log('Contributor Address:', rewardAddress.toBase58());
-
-    // Concatenate strings
-    const preimageString = seedPreamble + txidToReport + rewardAddress.toBase58();
-
-    console.log('Preimage String:', preimageString);
-
-    // Convert the concatenated string to bytes using UTF-8 encoding
-    const preimageBytes = Buffer.from(preimageString, 'utf8');
-
-    const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
-
-    console.log('Seed Hash:', seedHash.toString('hex'));
-
-    // Find the PDA for pendingPaymentAccount using the hashed seed
-    const [reportAccountPDA, reportAccountPDABump] = web3.PublicKey.findProgramAddressSync(
-      [seedHash],
-      program.programId
-    );
-    console.log('Report Account PDA:', reportAccountPDA.toString());
-
-    // Enum mappings (as strings)
     const TxidStatusEnum = {
       Invalid: "Invalid",
       PendingMining: "PendingMining",
       MinedPendingActivation: "MinedPendingActivation",
       MinedActivated: "MinedActivated"
     };
-
     const PastelTicketTypeEnum = {
       Sense: "Sense",
       Cascade: "Cascade",
@@ -274,62 +241,98 @@ describe('Data Report Submission', () => {
       InferenceApi: "InferenceApi"
     };
 
-    // Use the string representations
-    const txidStatusValue = TxidStatusEnum.MinedActivated;
-    const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
-    console.log(`TXID Status Value: ${txidStatusValue}, Pastel Ticket Type Value: ${pastelTicketTypeValue}`);
+    // Transfer SOL to each contributor
+    const transferAmountSOL = 0.1;
+    for (const contributor of contributors) {
+      const transferTransaction = new anchor.web3.Transaction().add(
+        anchor.web3.SystemProgram.transfer({
+          fromPubkey: admin.publicKey,
+          toPubkey: contributor.publicKey,
+          lamports: transferAmountSOL * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
 
-    console.log('Now submitting the data report...');
-    // Submit the data report
-    await program.methods.submitDataReport(
-      txidToReport,
-      txidStatusValue,
-      pastelTicketTypeValue,
-      'abcdef',
-      testContributor.publicKey
-    )
-    .accounts({
-      reportAccount: reportAccountPDA,
-      oracleContractState: oracleContractState.publicKey,
-      user: testContributor.publicKey,
-      systemProgram: web3.SystemProgram.programId
-    })
-    .signers([testContributor])
-    .rpc();
-    console.log('Data report submitted');
+      await provider.sendAndConfirm(transferTransaction);
+      console.log(`Transferred ${transferAmountSOL} SOL to contributor account with address ${contributor.publicKey.toBase58()}`);
+    }
 
-    // Fetch the updated state
-    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    console.log('Oracle Contract State:', state);
+     // Submit reports for each contributor
+    for (let i = 0; i < contributors.length; i++) {
+      const contributor = contributors[i];
+      const rewardAddress = contributor.publicKey;
+      const txidStatusValue = i < 8 ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
+      const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
 
-    // Fetch the updated state of the report account
-    const reportAccount = await program.account.pastelTxStatusReportAccount.fetch(reportAccountPDA);
-    console.log('Report Account Data:', reportAccount);
+      const preimageString = seedPreamble + txidToAdd + rewardAddress.toBase58();
+      const preimageBytes = Buffer.from(preimageString, 'utf8');
+      const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+      const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
+      
+      try {
+        // Create a new transaction
+        const transaction = new Transaction();
 
-    // Check if the report details match the submission
-    assert.strictEqual(reportAccount.report.txid, txidToReport, "TXID in report should match the submitted TXID");
-    assert.strictEqual(Object.keys(reportAccount.report.txidStatus)[0], "minedActivated", "TXID Status should match the submitted status");
-    assert.strictEqual(Object.keys(reportAccount.report.pastelTicketType)[0], "nft", "Pastel Ticket Type should match the submitted type");
+        // Add instruction to increase the compute budget
+        transaction.add(ComputeBudgetProgram.setComputeUnitLimit({
+          units: 1400000 // Setting the compute budget to 1.4M CU
+        }));
 
-    // Fetch the updated oracle contract state
-    const oracleState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    console.log('Oracle Contract State:', oracleState);
+        // Prepare the instruction for submitDataReport
+        const submitDataReportInstruction = await program.methods.submitDataReport(
+          txidToAdd,
+          txidStatusValue,
+          pastelTicketTypeValue,
+          'abcdef',
+          contributor.publicKey
+        )
+        .accounts({
+          reportAccount: reportAccountPDA,
+          oracleContractState: oracleContractState.publicKey,
+          user: contributor.publicKey,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .signers([contributor])
+        .instruction();
+
+        // Add the submitDataReport instruction to the transaction
+        transaction.add(submitDataReportInstruction);
+
+        // Send the transaction with increased compute budget
+        await provider.sendAndConfirm(transaction, [contributor]);
+        console.log(`Data report submitted by contributor ${i + 1}`);
+      } catch (error) {
+        console.error(`Error submitting report for contributor ${i + 1}:`, error);
+        throw error; // Rethrow to fail the test
+      }
+    }
+
+    // Fetch the updated state after all submissions
+    const updatedState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    console.log('Updated Oracle Contract State:', updatedState);
 
     // Check if the txid is in the monitored list
-    assert(oracleState.monitoredTxids.includes(txidToReport), "TXID should be in the monitored list");
+    assert(updatedState.monitoredTxids.includes(txidToAdd), "TXID should be in the monitored list");
 
-    // Find the contributor in the updated oracle contract state
-    const contributor = oracleState.contributors.find(c => c.rewardAddress.equals(testContributor.publicKey));
-    console.log('Contributor Data:', contributor);
+    // Verify the consensus data for the TXID
+    const consensusData = updatedState.aggregatedConsensusData.find(data => data.txid === txidToAdd);
+    assert(consensusData !== undefined, "Consensus data should be present for the TXID");
 
-    // Find the submission count for the specific TXID
-    const txidSubmission = oracleState.txidSubmissionCounts.find(submission => submission.txid === txidToReport);
+    // Assuming the consensus is based on the majority rule
+    const consensusStatusIndex = consensusData.statusWeights.indexOf(Math.max(...consensusData.statusWeights));
+    const consensusStatus = ['Invalid', 'PendingMining', 'MinedPendingActivation', 'MinedActivated'][consensusStatusIndex];
+    console.log('Consensus Status:', consensusStatus);
 
-    // Check if the submission count for the TXID has increased
-    assert(txidSubmission !== undefined, "TXID should be present in the submission counts");
-    assert(txidSubmission.count > 0, "Submission count for the TXID should be increased");
+    // Check if the majority consensus is achieved for 'MinedActivated'
+    assert(consensusStatus === 'MinedActivated', "Majority consensus should be 'MinedActivated'");
 
-    console.log('Data report submission verification successful for the TXID:', txidToReport);
+    // Check for the hash with the highest weight (assuming this logic is in your contract)
+    const consensusHash = consensusData.hashWeights.reduce((max, h) => max.weight > h.weight ? max : h, { hash: '', weight: -1 }).hash;
+    console.log('Consensus Hash:', consensusHash);
+
+    // Add further checks if needed based on the contract's consensus logic
+
+    console.log('Data report submission verification successful for the TXID:', txidToAdd);
+
   });
 });
 
