@@ -6,7 +6,7 @@ use anchor_lang::solana_program::hash::{hash, Hash};
 use std::cmp;
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
-const MIN_REPORTS_FOR_REWARD: u32 = 100; // Data Contributor must submit at least 100 reports to be eligible for rewards
+const MIN_REPORTS_FOR_REWARD: u32 = 10; // Data Contributor must submit at least 10 reports to be eligible for rewards
 const MIN_COMPLIANCE_SCORE_FOR_REWARD: i32 = 80; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
 const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount, which is scaled based on the number of highly reliable contributors
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
@@ -173,33 +173,22 @@ pub struct DataReportSubmitted {
 // Function to update the submission count for a given txid
 fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
     // Get the current timestamp
-    let current_timestamp = Clock::get()?.unix_timestamp;
-    // Convert the timestamp to u64
-    let current_timestamp_u64 = current_timestamp.try_into().map_err(|_| {
-        OracleError::InvalidTimestamp
-    })?;
+    let current_timestamp_u64 = Clock::get()?.unix_timestamp as u64;
 
-    let mut found = false;
-
-    // Iterate through txid submission counts
-    for count in &mut state.txid_submission_counts {
-        if count.txid == txid {
-            count.count += 1;
-            count.last_updated = current_timestamp_u64;
-            found = true;
-            break;
-        }
-    }
-
-    // If the txid was not found, add a new entry
-    if !found {
+    // Check if the txid already exists in the submission counts
+    if let Some(count) = state.txid_submission_counts.iter_mut().find(|c| c.txid == txid) {
+        // Update the existing count
+        count.count += 1;
+        count.last_updated = current_timestamp_u64;
+    } else {
+        // Insert a new count if the txid does not exist
         state.txid_submission_counts.push(TxidSubmissionCount {
             txid: txid.to_string(),
             count: 1,
             last_updated: current_timestamp_u64,
         });
-    } else {
     }
+
     Ok(())
 }
 
@@ -250,25 +239,26 @@ pub fn submit_data_report_helper(ctx: Context<SubmitDataReport>, txid: String, r
 
 
 fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxStatusReport, weight: u32, txid: &str) -> Result<()> {
-    let weight_i32 = weight.try_into().unwrap(); // Convert weight to i32
-    let current_timestamp = Clock::get()?.unix_timestamp as u64; // Get the current timestamp
+    let weight_i32 = weight as i32; // Direct conversion without try_into
+    let current_timestamp = Clock::get()?.unix_timestamp as u64; // Get the current timestamp only once
 
-    let data = state.aggregated_consensus_data.iter_mut().find(|data| data.txid == *txid);
+    // Find existing data or create new
+    let data = state.aggregated_consensus_data.iter_mut().find(|d| d.txid == txid);
 
-    if let Some(data) = data {
+    if let Some(data_entry) = data {
         // Update existing data
-        data.status_weights[report.txid_status as usize] += weight_i32;
+        data_entry.status_weights[report.txid_status as usize] += weight_i32;
         if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            update_hash_weight(&mut data.hash_weights, hash, weight_i32);
+            update_hash_weight(&mut data_entry.hash_weights, hash, weight_i32);
         }
-        data.last_updated = current_timestamp; // Update the timestamp
+        data_entry.last_updated = current_timestamp;
     } else {
         // Create new data
         let mut new_data = AggregatedConsensusData {
             txid: txid.to_string(),
             status_weights: [0; TXID_STATUS_VARIANT_COUNT],
             hash_weights: Vec::new(),
-            last_updated: current_timestamp, // Set the timestamp
+            last_updated: current_timestamp,
         };
         new_data.status_weights[report.txid_status as usize] += weight_i32;
         if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
@@ -276,6 +266,7 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
         }
         state.aggregated_consensus_data.push(new_data);
     }
+
     Ok(())
 }
 
@@ -706,15 +697,19 @@ pub struct ContributorUpdatedEvent {
 }
 
 
-// This method will now be part of an instruction or a helper function.
 pub fn update_activity_and_compliance_helper(
     contributor: &mut Contributor, 
     current_timestamp: u64, 
     is_accurate: bool,
 ) -> Result<()> {
+    msg!("Updating Contributor: {}, Is Accurate Report: {}", contributor.reward_address, is_accurate);
+
     // Ensure that you're correctly mutating fields in the contributor account
     contributor.last_active_timestamp = current_timestamp;
     contributor.total_reports_submitted += 1;
+
+    msg!("Updated Activity: Last Active Timestamp: {}, Total Reports Submitted: {}", 
+        contributor.last_active_timestamp, contributor.total_reports_submitted);
 
     let progressive_scaling = 1.0 / (1.0 + (contributor.total_reports_submitted as f32 * 0.01).log10());
     let time_diff = current_timestamp - contributor.last_active_timestamp;
@@ -729,24 +724,35 @@ pub fn update_activity_and_compliance_helper(
         contributor.accurate_reports_count += 1;
         contributor.current_streak += 1;
         contributor.compliance_score += ((score_increment as f32) * progressive_scaling * time_weight + streak_bonus) as i32;
+        msg!("Accurate report. Updated Accurate Reports Count: {}, Current Streak: {}, Compliance Score: {}", 
+            contributor.accurate_reports_count, contributor.current_streak, contributor.compliance_score);
     } else {
         contributor.current_streak = 0;
         contributor.compliance_score -= (score_decrement as f32 * time_weight) as i32;
+        msg!("Inaccurate report. Reset Current Streak to 0, Updated Compliance Score: {}", 
+            contributor.compliance_score);
     }
 
     contributor.compliance_score = cmp::min(cmp::max(contributor.compliance_score, -100), 100);
 
-    // Calculate reliability score
     if contributor.total_reports_submitted > 0 {
         contributor.reliability_score = (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32 * 100.0) as u32;
+        msg!("Updated Reliability Score: {}", contributor.reliability_score);
     }
 
     // Handle consensus failure and bans
-    contributor.consensus_failures += 1;
-    if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
-        contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
-    } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
-        contributor.ban_expiry = u64::MAX;
+    msg!("Evaluating consensus failures...");
+    if !is_accurate {
+        contributor.consensus_failures += 1;
+        msg!("Incremented Consensus Failures: {}", contributor.consensus_failures);
+
+        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
+            contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
+            msg!("Temporary ban applied. Ban Expiry: {}", contributor.ban_expiry);
+        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
+            contributor.ban_expiry = u64::MAX;
+            msg!("Permanent ban applied.");
+        }
     }
 
     // Update statuses
@@ -770,8 +776,7 @@ pub fn update_activity_and_compliance_helper(
         is_eligible_for_rewards: contributor.is_eligible_for_rewards,
     });
 
-    msg!("Contributor {} updated: Last Active Timestamp: {}, Total Reports Submitted: {}, Accurate Reports Count: {}, Current Streak: {}, Compliance Score: {}, Reliability Score: {}, Consensus Failures: {}, Ban Expiry: {}, Is Recently Active: {}, Is Reliable: {}, Is Eligible For Rewards: {}", contributor.reward_address, contributor.last_active_timestamp, contributor.total_reports_submitted, contributor.accurate_reports_count, contributor.current_streak, contributor.compliance_score, contributor.reliability_score, contributor.consensus_failures, contributor.ban_expiry, contributor.is_recently_active, contributor.is_reliable, contributor.is_eligible_for_rewards);
-
+    msg!("Contributor Update Complete: {}", contributor.reward_address);
     Ok(())
 
 }
@@ -916,7 +921,6 @@ pub struct ConsensusReachedEvent {
     pub number_of_contributors_included: u32,
 }
 
-
 fn calculate_consensus_and_cleanup(
     program_id: &Pubkey,
     state: &mut OracleContractState, 
@@ -926,54 +930,69 @@ fn calculate_consensus_and_cleanup(
         .find(|data| data.txid == txid)
         .ok_or(OracleError::InvalidTxid)?;
 
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
-    let consensus_status = usize_to_txid_status(
-        aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, &weight)| weight).unwrap_or((0, &0)).0
-    ).unwrap_or(TxidStatus::Invalid);
+    msg!("Aggregated Data Found for TXID: {}", txid);        
+    
+    // Efficient consensus calculation
+    let max_weight = aggregated_data.status_weights.iter().max().unwrap_or(&0);
+    let consensus_status_index = aggregated_data.status_weights.iter().position(|&w| w == *max_weight).unwrap_or(0);
+    let consensus_status = usize_to_txid_status(consensus_status_index).unwrap_or(TxidStatus::Invalid);
+    msg!("Consensus Status: {:?}, Max Weight: {}", consensus_status, max_weight);
 
-    // Find the hash with the highest weight
+    // Finding the hash with the highest weight
     let consensus_hash = aggregated_data.hash_weights.iter()
         .max_by_key(|hash_weight| hash_weight.weight)
         .map(|hash_weight| hash_weight.hash.clone())
         .unwrap_or_default();
+    msg!("Consensus Hash: {}", consensus_hash);
 
+    // Pre-calculate seeds and PDAs for contributors
+    let contributor_seeds: Vec<_> = state.contributors.iter()
+        .map(|contributor| create_seed("pastel_tx_status_report", txid, &contributor.reward_address.key()))
+        .collect();
+    msg!("Contributor Seeds Prepared");        
+
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
     let mut contributor_count = 0;
-    for contributor in &mut state.contributors {
+
+    for (contributor, seed) in state.contributors.iter_mut().zip(contributor_seeds.iter()) {
         if contributor.ban_expiry > current_timestamp {
-            continue; // Skip banned contributors
+            msg!("Contributor {} is banned, skipping", contributor.reward_address);
+            continue;
         }
 
-        // Use the new create_seed function to generate the seed
-        let seed = create_seed("pastel_tx_status_report", txid, &contributor.reward_address.key());
         let (pda, _bump_seed) = Pubkey::find_program_address(&[seed.as_ref()], program_id);
-        
-        let mut lamports = 0; // Declare lamports as mutable       
+        msg!("PDA Calculated: {}", pda);
+
+        let mut lamports = 0;
         let mut data = vec![];
         let report_account_info = AccountInfo::new(
-            &pda,
-            false, // is_signer
-            true,  // is_writable
-            &mut lamports,
-            &mut data,
-            program_id,
-            false, // is_executable
-            0      // rent_epoch
+            &pda, false, true, &mut lamports, &mut data, program_id, false, 0
         );
 
         if let Ok(report_account) = Account::<PastelTxStatusReportAccount>::try_from(&report_account_info) {
             let report = &report_account.report;
             let is_accurate_status = report.txid_status == consensus_status;
-            let is_accurate_hash = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
+            msg!("Comparing txid_status: Report: {:?}, Consensus: {:?}", report.txid_status, consensus_status);
+            
+            let is_accurate_hash: bool = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref()
+                .map_or(false, |hash| {
+                    let hash_comparison = hash == &consensus_hash;
+                    msg!("Comparing Hash: Report: {}, Consensus: {}, Result: {}", hash, consensus_hash, hash_comparison);
+                    hash_comparison
+                });
+            
             let is_accurate = is_accurate_status && is_accurate_hash;
+            msg!("Final Accuracy Determination: Status: {}, Hash: {}, Overall: {}", is_accurate_status, is_accurate_hash, is_accurate);
 
             if is_accurate || is_accurate_hash {
+                msg!("Contributor {} is accurate, updating activity and compliance", contributor.reward_address);
                 contributor_count += 1;
             }
 
             update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
         }
     }
-    msg!("Consensus Reached for Pastel TXID: {}, Status: {:?}, Hash: {}", txid, consensus_status, consensus_hash);
+    msg!("Consensus Reached for Pastel TXID: {}, Status: {:?}, Hash: {}, Number of Contributors: {}", txid, consensus_status, consensus_hash, contributor_count);
 
     emit!(ConsensusReachedEvent {
         txid: txid.to_string(),
@@ -982,11 +1001,7 @@ fn calculate_consensus_and_cleanup(
         number_of_contributors_included: contributor_count,
     });
 
-    // Call to assess and apply bans
     state.assess_and_apply_bans(current_timestamp);
-
-    // Fetch the current timestamp outside the closure
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
     // Cleanup logic to retain only recent consensus data
     state.aggregated_consensus_data.retain(|data| {
@@ -996,37 +1011,31 @@ fn calculate_consensus_and_cleanup(
     Ok(())
 }
 
-
 // Function to handle the submission of Pastel transaction status reports
 fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()> {
-    // Validate the TXID is non-empty
+    // Direct return in case of invalid data, reducing nested if conditions
     if report.txid.trim().is_empty() {
         msg!("Error: InvalidTxid (TXID is empty)");
         return Err(OracleError::InvalidTxid.into());
     } 
 
-    // Validate TXID status
-    match report.txid_status {
-        TxidStatus::MinedActivated | 
-        TxidStatus::MinedPendingActivation | 
-        TxidStatus::PendingMining | 
-        TxidStatus::Invalid => {
-            msg!("TXID status is valid");
-        }
+    // Simplified TXID status validation
+    if !matches!(report.txid_status, TxidStatus::MinedActivated | TxidStatus::MinedPendingActivation | TxidStatus::PendingMining | TxidStatus::Invalid) {
+        return Err(OracleError::InvalidTxidStatus.into());
     }
-    
-    // Validate the Pastel ticket type is present and valid
+
+    // Direct return in case of missing data, reducing nested if conditions
     if report.pastel_ticket_type.is_none() {
         msg!("Error: Missing Pastel Ticket Type");
         return Err(OracleError::MissingPastelTicketType.into());
     }
 
-    // Validate the SHA3-256 hash of the corresponding file
+    // Direct return in case of invalid hash, reducing nested if conditions
     if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
         if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             msg!("Error: Invalid File Hash Length or Non-hex characters");
             return Err(OracleError::InvalidFileHashLength.into());
-        } 
+        }
     } else {
         return Err(OracleError::MissingFileHash.into());
     }
@@ -1040,7 +1049,6 @@ impl OracleContractState {
         for contributor in &mut self.contributors {
             contributor.handle_consensus_failure(current_time);
         }
-
         self.contributors.retain(|c| !c.calculate_is_banned(current_time));
     }
 }
@@ -1075,12 +1083,10 @@ impl Contributor {
 
     // Method to check if the contributor is reliable
     fn calculate_is_reliable(&self) -> bool {
-        // Define what makes a contributor reliable
-        // For example, a high reliability score which is a ratio of accurate reports to total reports
+        // Define what makes a contributor reliable; for example, a high reliability score which is a ratio of accurate reports to total reports
         if self.total_reports_submitted == 0 {
             return false; // Avoid division by zero
         }
-
         let reliability_ratio = self.accurate_reports_count as f32 / self.total_reports_submitted as f32;
         reliability_ratio >= 0.8 // Example threshold for reliability, e.g., 80% accuracy
     }    

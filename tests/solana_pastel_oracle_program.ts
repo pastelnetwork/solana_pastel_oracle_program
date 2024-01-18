@@ -18,6 +18,24 @@ const NUM_CONTRIBUTORS = 10;
 let contributors = []; // Array to store contributor keypairs
 const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
+const MIN_REPORTS_FOR_REWARD = 10;
+const MIN_COMPLIANCE_SCORE_FOR_REWARD = 80;
+const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
+const maxSize = 200 * 1024; // 200KB
+
+const TxidStatusEnum = {
+  Invalid: "Invalid",
+  PendingMining: "PendingMining",
+  MinedPendingActivation: "MinedPendingActivation",
+  MinedActivated: "MinedActivated"
+};
+
+const PastelTicketTypeEnum = {
+  Sense: "Sense",
+  Cascade: "Cascade",
+  Nft: "Nft",
+  InferenceApi: "InferenceApi"
+};
 
 console.log("Program ID:", programID.toString());
 console.log("Admin ID:", admin.publicKey.toString());
@@ -67,7 +85,6 @@ describe('Initialization', () => {
     assert.equal(state.adminPubkey.toString(), admin.publicKey.toString(), "Admin public key should match after first init");
 
     // Incremental Reallocation
-    const maxSize = 100 * 1024; // 100KB
     let currentSize = 10_240;   // Initial size after first init
 
     while (currentSize < maxSize) {
@@ -168,81 +185,65 @@ describe('Contributor Registration', () => {
   });
 });
 
-
-
 describe('TXID Monitoring', () => {
-  it('Adds a new TXID for monitoring', async () => {
-    // Setup
+  it('Adds multiple TXIDs for monitoring', async () => {
+    // Define the number of TXIDs to add for monitoring
+    const numTxids = MIN_REPORTS_FOR_REWARD;
 
-    const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
-    const expectedAmountStr = expectedAmountLamports.toString();
+    // Helper function to generate a random TXID
+    const generateRandomTxid = () => {
+      return [...Array(64)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+    };
 
-    // Concatenate "pending_payment", txidToAdd, and the Base58 string of admin's public key
-    const preimageString = "pending_payment" + txidToAdd + admin.publicKey.toBase58();
-    console.log('Preimage String:', preimageString);
+    for (let i = 0; i < numTxids; i++) {
+      const txid = generateRandomTxid();
 
-    // Convert the concatenated string to bytes using UTF-8 encoding
-    const preimageBytes = Buffer.from(preimageString, 'utf8');
+      const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
+      const expectedAmountStr = expectedAmountLamports.toString();
 
-    const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+      const preimageString = "pending_payment" + txid + admin.publicKey.toBase58();
+      const preimageBytes = Buffer.from(preimageString, 'utf8');
+      const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+      const [pendingPaymentAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
 
-    // Find the PDA for pendingPaymentAccount using the hashed seed
-    const [pendingPaymentAccountPDA, pendingPaymentAccountBump] = web3.PublicKey.findProgramAddressSync(
-      [seedHash],
-      program.programId
-    );
+      await program.methods.addPendingPayment(txid, expectedAmountStr, "Pending")
+        .accounts({
+          pendingPaymentAccount: pendingPaymentAccountPDA,
+          oracleContractState: oracleContractState.publicKey,
+          user: admin.publicKey,
+          systemProgram: web3.SystemProgram.programId
+        })
+        .rpc();
 
-    await program.methods.addPendingPayment(txidToAdd, expectedAmountStr, "Pending")
-    .accounts({
-      pendingPaymentAccount: pendingPaymentAccountPDA,
-      oracleContractState: oracleContractState.publicKey,
-      user: admin.publicKey,
-      systemProgram: web3.SystemProgram.programId
-    })
-    .rpc();
+      await program.methods.addTxidForMonitoring({ txid: txid })
+        .accounts({
+          oracleContractState: oracleContractState.publicKey,
+          caller: admin.publicKey,
+          pendingPaymentAccount: pendingPaymentAccountPDA,
+          user: admin.publicKey,
+          systemProgram: web3.SystemProgram.programId
+        })
+        .rpc();
 
-    // Invoke the add_txid_for_monitoring method
-    await program.methods.addTxidForMonitoring({ txid: txidToAdd })
-      .accounts({
-        oracleContractState: oracleContractState.publicKey,
-        caller: admin.publicKey,
-        pendingPaymentAccount: pendingPaymentAccountPDA,
-        user: admin.publicKey,
-        systemProgram: web3.SystemProgram.programId
-      })
-      .rpc();
+      // Fetch the updated state
+      const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+      const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(pendingPaymentAccountPDA);
 
-    // Fetch the updated state
-    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(pendingPaymentAccountPDA);
-
-    // Assertions
-    assert(state.monitoredTxids.includes(txidToAdd), 'The TXID should be added to the monitored list');
-    assert.strictEqual(pendingPaymentData.pendingPayment.expectedAmount.toNumber(), expectedAmountLamports, 'The expected amount for pending payment should match');
-    console.log('TXID successfully added for monitoring');
+      // Assertions for each TXID
+      assert(state.monitoredTxids.includes(txid), `The TXID ${txid} should be added to the monitored list`);
+      assert.strictEqual(pendingPaymentData.pendingPayment.expectedAmount.toNumber(), expectedAmountLamports, `The expected amount for pending payment for TXID ${txid} should match`);
+      console.log(`TXID ${txid} successfully added for monitoring`);
+    }
   });
 });
 
-
 describe('Data Report Submission', () => {
-  it('Submits data reports for a monitored TXID with consensus and dissent', async () => {
+  it('Submits multiple data reports for different TXIDs with consensus and dissent', async () => {
     // Define the monitored TXID
     const seedPreamble = "pastel_tx_status_report";
-    const TxidStatusEnum = {
-      Invalid: "Invalid",
-      PendingMining: "PendingMining",
-      MinedPendingActivation: "MinedPendingActivation",
-      MinedActivated: "MinedActivated"
-    };
-    const PastelTicketTypeEnum = {
-      Sense: "Sense",
-      Cascade: "Cascade",
-      Nft: "Nft",
-      InferenceApi: "InferenceApi"
-    };
 
     // Transfer SOL to each contributor
-    const transferAmountSOL = 0.1;
+    const transferAmountSOL = 1.0;
     for (const contributor of contributors) {
       const transferTransaction = new anchor.web3.Transaction().add(
         anchor.web3.SystemProgram.transfer({
@@ -336,3 +337,184 @@ describe('Data Report Submission', () => {
   });
 });
 
+
+describe('Data Report Submission', () => {
+  it('Submits multiple data reports for different TXIDs with consensus and dissent', async () => {
+    const seedPreamble = "pastel_tx_status_report";
+
+    // Fetch monitored TXIDs from the updated state
+    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    const monitoredTxids = state.monitoredTxids;
+
+    // Loop through each monitored TXID
+    for (const txid of monitoredTxids) {
+      // Generate a random file hash for this TXID
+      const randomFileHash = [...Array(6)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+
+      for (let i = 0; i < contributors.length; i++) {
+        const contributor = contributors[i];
+        const rewardAddress = contributor.publicKey;
+
+        // Randomize the status value for each report
+        const txidStatusValue = i < 8 ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
+        const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
+
+        const preimageString = seedPreamble + txid + rewardAddress.toBase58();
+        const preimageBytes = Buffer.from(preimageString, 'utf8');
+        const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+        const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
+
+        // Create and send the transaction
+        try {
+          const transaction = new Transaction();
+          transaction.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1400000 }));
+
+          const submitDataReportInstruction = await program.methods.submitDataReport(
+            txid,
+            txidStatusValue,
+            pastelTicketTypeValue,
+            randomFileHash,
+            contributor.publicKey
+          )
+          .accounts({
+            reportAccount: reportAccountPDA,
+            oracleContractState: oracleContractState.publicKey,
+            user: contributor.publicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .signers([contributor])
+          .instruction();
+
+          transaction.add(submitDataReportInstruction);
+          await provider.sendAndConfirm(transaction, [contributor]);
+          console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
+        } catch (error) {
+          console.error(`Error submitting report for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, error);
+          throw error;
+        }
+      }
+
+      // Fetch the updated state and verify consensus data for each TXID
+      const updatedState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+      const consensusData = updatedState.aggregatedConsensusData.find(data => data.txid === txid);
+
+      if (consensusData) {
+        const consensusStatusIndex = consensusData.statusWeights.indexOf(Math.max(...consensusData.statusWeights));
+        const consensusStatus = ['Invalid', 'PendingMining', 'MinedPendingActivation', 'MinedActivated'][consensusStatusIndex];
+        console.log(`Consensus Status for TXID ${txid}:`, consensusStatus);
+      } else {
+        console.log(`No consensus data found for TXID ${txid}`);
+      }
+    }
+
+    // Loop through each monitored TXID for validation
+    for (const txid of monitoredTxids) {
+      // Fetch the updated state after all submissions for this TXID
+      const updatedState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+      console.log(`Updated Oracle Contract State for TXID ${txid}:`, updatedState);
+
+      // Check if the txid is in the monitored list
+      assert(updatedState.monitoredTxids.includes(txid), `TXID ${txid} should be in the monitored list`);
+
+      // Verify the consensus data for the TXID
+      const consensusData = updatedState.aggregatedConsensusData.find(data => data.txid === txid);
+      assert(consensusData !== undefined, `Consensus data should be present for the TXID ${txid}`);
+
+      // Assuming the consensus is based on the majority rule
+      const consensusStatusIndex = consensusData.statusWeights.indexOf(Math.max(...consensusData.statusWeights));
+      const consensusStatus = ['Invalid', 'PendingMining', 'MinedPendingActivation', 'MinedActivated'][consensusStatusIndex];
+      console.log(`Consensus Status for TXID ${txid}:`, consensusStatus);
+
+      // Check if the majority consensus is achieved for 'MinedActivated'
+      assert(consensusStatus === 'MinedActivated', `Majority consensus for TXID ${txid} should be 'MinedActivated'`);
+
+      // Check for the hash with the highest weight
+      const consensusHash = consensusData.hashWeights.reduce((max, h) => max.weight > h.weight ? max : h, { hash: '', weight: -1 }).hash;
+      console.log(`Consensus Hash for TXID ${txid}:`, consensusHash);
+
+      // Add further checks if needed based on the contract's consensus logic
+      console.log(`Data report submission verification successful for the TXID: ${txid}`);
+    }
+  });
+});
+
+
+// describe('Eligibility for Rewards', () => {
+//   it('should check if contributors meet reward eligibility criteria', async () => {
+//     // Fetch the updated state after all submissions
+//     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+
+//     // Loop through each contributor and check their eligibility
+//     for (const contributor of contributors) {
+//       const contributorData = state.contributors.find(c => c.rewardAddress.equals(contributor.publicKey));
+
+//       // Define your eligibility criteria based on your contract logic
+//       const isEligibleForRewards = contributorData.totalReportsSubmitted >= MIN_REPORTS_FOR_REWARD 
+//                                     && contributorData.reliabilityScore >= 80 
+//                                     && contributorData.complianceScore >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
+
+//       assert(isEligibleForRewards, `Contributor with address ${contributor.publicKey.toBase58()} should be eligible for rewards`);
+//     }
+//   });
+// });
+
+
+// describe('Reward Distribution', () => {
+//   it('should distribute rewards correctly from the reward pool', async () => {
+//     // Choose an eligible contributor
+//     const eligibleContributor = contributors[0]; // Assuming the first contributor is eligible
+
+//     // Find the PDA for the RewardPoolAccount
+//     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("reward_pool")],
+//       program.programId
+//     );
+    
+//     // Get initial balance of the reward pool
+//     const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+
+//     // Request reward for the eligible contributor
+//     await program.methods.requestReward(eligibleContributor.publicKey)
+//       .accounts({
+//         rewardPoolAccount: rewardPoolAccountPDA,
+//         oracleContractState: oracleContractState.publicKey
+//       })
+//       .rpc();
+
+//     // Get updated balance of the reward pool
+//     const updatedRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+
+//     // Check if the balance is deducted correctly
+//     const expectedBalanceAfterReward = initialRewardPoolBalance - BASE_REWARD_AMOUNT_IN_LAMPORTS;
+//     assert.equal(updatedRewardPoolBalance, expectedBalanceAfterReward, 'Reward pool balance should be deducted by the reward amount');
+//   });
+// });
+
+
+// describe('Request Reward for Ineligible Contributor', () => {
+//   it('should not allow reward requests from ineligible contributors', async () => {
+//     // Choose an ineligible contributor
+//     const ineligibleContributor = contributors[contributors.length - 1]; // Assuming the last contributor is ineligible
+
+//     // Find the PDA for the RewardPoolAccount
+//     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("reward_pool")],
+//       program.programId
+//     );
+
+//     try {
+//       // Attempt to request reward
+//       await program.methods.requestReward(ineligibleContributor.publicKey)
+//         .accounts({
+//           rewardPoolAccount: rewardPoolAccountPDA,
+//           oracleContractState: oracleContractState.publicKey
+//         })
+//         .rpc();
+
+//       throw new Error('Reward request should have failed for ineligible contributor');
+//     } catch (error) {
+//       // Check for the specific error thrown by your program
+//       assert.equal(error.msg, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
+//     }
+//   });
+// });
