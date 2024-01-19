@@ -19,15 +19,15 @@ const MIN_NUMBER_OF_ORACLES: usize = 10; // Minimum number of oracles to calcula
 const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS: u64 = 20 * 60; // Maximum duration in seconds from last report submission for a given TXID before computing consensus (e.g., 20 minutes)
 const DATA_RETENTION_PERIOD: u64 = 3 * 24 * 60 * 60; // How long to keep data in the contract state (3 days)
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to retain submission counts (i.e., 24 hours)
-const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
+const TXID_STATUS_VARIANT_COUNT: usize = 5; // Manually define the number of variants in TxidStatus
 
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
-const MAX_CONTRIBUTORS: usize = 200; // Adjust as needed
-const MAX_TXID_SUBMISSION_COUNTS: usize = 1000; // Adjust as needed
-const MAX_MONITORED_TXIDS: usize = 1000; // Adjust as needed
-const MAX_AGGREGATED_CONSENSUS_DATA: usize = 1000; // Adjust as needed
-const MAX_TEMP_TX_STATUS_REPORTS: usize = 1000; // Adjust as needed
-const MAX_HASH_WEIGHTS: usize = 5000; // Adjust this number based on your needs
+const MAX_CONTRIBUTORS: usize = 100; // Adjust as needed
+const MAX_TXID_SUBMISSION_COUNTS: usize = 100; // Adjust as needed
+const MAX_MONITORED_TXIDS: usize = 100; // Adjust as needed
+const MAX_AGGREGATED_CONSENSUS_DATA: usize = 100; // Adjust as needed
+const MAX_TEMP_TX_STATUS_REPORTS: usize = 100; // Adjust as needed
+const MAX_HASH_WEIGHTS: usize = 200; // Adjust this number based on your needs
 const TRANSACTION_SIGNATURE_LENGTH: usize = 64; // Adjust as needed
 
 #[error_code]
@@ -178,16 +178,7 @@ impl Default for PastelTxStatusReport {
 
 // Functions to convert between Strings and byte arrays
 impl PastelTxStatusReport {
-    fn new(txid: &str, txid_status: TxidStatus, pastel_ticket_type: Option<PastelTicketType>, hash_segment: Option<&str>, timestamp: u64, contributor_reward_address: Pubkey) -> Self {
-        Self {
-            txid: Self::string_to_fixed_array(txid),
-            txid_status,
-            pastel_ticket_type,
-            first_6_characters_of_sha3_256_hash_of_corresponding_file: hash_segment.map(Self::string_to_fixed_array_6),
-            timestamp,
-            contributor_reward_address,
-        }
-    }
+
 
     fn string_to_fixed_array(s: &str) -> [u8; MAX_TXID_LENGTH] {
         let mut array = [0u8; MAX_TXID_LENGTH];
@@ -217,22 +208,6 @@ pub struct TxidSubmissionCount {
     pub last_updated: u64,
 }
 
-impl TxidSubmissionCount {
-    fn new(txid: &str, count: u32, last_updated: u64) -> Self {
-        Self {
-            txid: Self::string_to_fixed_array(txid),
-            count,
-            last_updated,
-        }
-    }
-
-    fn string_to_fixed_array(s: &str) -> [u8; MAX_TXID_LENGTH] {
-        let mut array = [0u8; MAX_TXID_LENGTH];
-        let bytes = s.as_bytes();
-        array[..bytes.len()].copy_from_slice(bytes);
-        array
-    }
-}
 
 impl Default for TxidSubmissionCount {
     fn default() -> Self {
@@ -370,11 +345,6 @@ fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, 
         .unwrap_or([0u8; 6]);
 
     (consensus_status, consensus_hash)
-}
-
-// Function to convert a byte array to a hex string
-fn bytes_to_hex_string(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 
 fn calculate_consensus_and_cleanup(
@@ -775,28 +745,8 @@ impl HashWeight {
     }
 }
 
-// Function to update hash weight
-fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: [u8; 6], weight: i32) {
-    let mut found = false;
-
-    for hash_weight in hash_weights.iter_mut() {
-        if hash_weight.hash == Some(hash) {
-            hash_weight.weight += weight;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        hash_weights.push(HashWeight {
-            hash: Some(hash),
-            weight,
-        });
-    }
-}
 
 // Struct to hold aggregated data for consensus calculation
-
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize, Copy)]
 pub struct AggregatedConsensusData {
     pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid
@@ -1134,7 +1084,7 @@ pub fn update_bans_and_statuses(contributor: &mut Contributor, current_timestamp
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct AddTxidForMonitoringData {
-    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
+    pub txid: String, // Use String for txid
 }
 
 #[derive(Accounts)]
@@ -1157,9 +1107,10 @@ pub struct AddTxidForMonitoring<'info> {
 
 #[event]
 pub struct TxidAddedForMonitoringEvent {
-    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
+    pub txid: String, // Use String for txid
     pub expected_amount: u64,
 }
+
 
 pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
     let state = &mut ctx.accounts.oracle_contract_state;
@@ -1168,48 +1119,45 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
         return Err(OracleError::NotBridgeContractAddress.into());
     }
 
-    // Explicitly cast txid to String and ensure it meets requirements
-    let txid = data.txid.clone();
-    if txid.len() > MAX_TXID_LENGTH {
+    // Check the length of txid
+    if data.txid.len() > MAX_TXID_LENGTH {
         msg!("TXID exceeds maximum length.");
         return Err(OracleError::InvalidTxid.into());
     }
+
+    // Convert txid to fixed-size byte array for internal use
+    let txid_bytes = PastelTxStatusReport::string_to_fixed_array(&data.txid);
 
     // Find an empty slot in the monitored_txids array to insert the new txid
     let mut inserted = false;
     for monitored_txid in state.monitored_txids.iter_mut() {
         if monitored_txid.iter().all(|&byte| byte == 0) {
-            *monitored_txid = data.txid;
+            *monitored_txid = txid_bytes;
             inserted = true;
             break;
         }
     }
-
     if !inserted {
         msg!("No available slot to monitor new TXID");
         return Err(OracleError::MemoryAllocationFailed.into());
     }
 
+
     // Initialize pending_payment_account here using the txid
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
     pending_payment_account.pending_payment = PendingPayment {
-        txid: txid.clone(),
+        txid: txid_bytes,
         expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
-        payment_status: PaymentStatus::Pending, // Enum, no need for casting
+        payment_status: PaymentStatus::Pending,
     };
 
     // Emit an event for adding TXID for monitoring
     emit!(TxidAddedForMonitoringEvent {
-        txid: txid.clone(),
+        txid: data.txid.clone(),
         expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
     });
 
-    // Convert txid to UTF-8 string for logging, if possible
-    let txid_utf8 = match std::str::from_utf8(&data.txid) {
-        Ok(str) => str.to_string(),
-        Err(_) => "Invalid UTF-8".to_string(),
-    };
-    msg!("Added Pastel TXID for Monitoring: {}", txid_utf8);
+    msg!("Added Pastel TXID for Monitoring: {}", data.txid);
 
     Ok(())
 }
@@ -1279,10 +1227,11 @@ pub fn normalize_compliance_score(score: i32) -> i32 {
 
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
     match index {
-        0 => Some(TxidStatus::Invalid),
-        1 => Some(TxidStatus::PendingMining),
-        2 => Some(TxidStatus::MinedPendingActivation),
-        3 => Some(TxidStatus::MinedActivated),
+        0 => Some(TxidStatus::PlaceholderValue),
+        1 => Some(TxidStatus::Invalid),
+        2 => Some(TxidStatus::PendingMining),
+        3 => Some(TxidStatus::MinedPendingActivation),
+        4 => Some(TxidStatus::MinedActivated),
         _ => None,
     }
 }
@@ -1341,11 +1290,6 @@ impl OracleContractState {
 }
 
 impl Contributor {
-
-    fn is_placeholder(&self) -> bool {
-        // Define the condition for a contributor to be considered a placeholder: check if the reward address is a default value
-        self.reward_address == Pubkey::default()
-    }
 
     // Method to handle consensus failure
     pub fn handle_consensus_failure(&mut self, current_time: u64) {

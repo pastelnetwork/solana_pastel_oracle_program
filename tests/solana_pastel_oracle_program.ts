@@ -22,6 +22,18 @@ const MIN_REPORTS_FOR_REWARD = 10;
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
 const maxSize = 200 * 1024; // 200KB
+const MAX_TXID_LENGTH = 64;
+
+const stringToFixedArray = (s) => {
+  const array = new Uint8Array(MAX_TXID_LENGTH);
+  const bytes = Buffer.from(s, 'hex');
+  array.set(bytes);
+  return array;
+};
+
+const fixedArrayToString = (array) => {
+  return Buffer.from(array).toString('hex');
+};
 
 const TxidStatusEnum = {
   Invalid: "Invalid",
@@ -230,8 +242,12 @@ describe('TXID Monitoring', () => {
       const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
       const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(pendingPaymentAccountPDA);
 
+      // Convert monitoredTxids to strings for comparison
+      const monitoredTxidsAsStrings = state.monitoredTxids.map(txidArray => Buffer.from(txidArray).toString('hex'));
+
       // Assertions for each TXID
-      assert(state.monitoredTxids.includes(txid), `The TXID ${txid} should be added to the monitored list`);
+      assert(monitoredTxidsAsStrings.includes(txid), `The TXID ${txid} should be added to the monitored list`);
+      
       assert.strictEqual(pendingPaymentData.pendingPayment.expectedAmount.toNumber(), expectedAmountLamports, `The expected amount for pending payment for TXID ${txid} should match`);
       console.log(`TXID ${txid} successfully added for monitoring`);
     }
@@ -264,7 +280,10 @@ describe('Data Report Submission', () => {
     const monitoredTxids = state.monitoredTxids;
 
     // Loop through each monitored TXID
-    for (const txid of monitoredTxids) {
+    for (const txidArray of monitoredTxids) {
+      // Convert the txid byte array back to a string
+      const txid = fixedArrayToString(txidArray);
+
       // Generate a random file hash for this TXID
       const randomFileHash = [...Array(6)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
       console.log(`Random file hash (first 6 characters) for TXID ${txid} generated as:`, randomFileHash);
@@ -322,7 +341,14 @@ describe('Data Report Submission', () => {
 
       // Fetch the updated state and verify consensus data for each TXID
       const updatedState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-      const consensusData = updatedState.aggregatedConsensusData.find(data => data.txid === txid);
+      
+      // Convert the txid string to a byte array for comparison
+      const txidByteArray = stringToFixedArray(txid);
+
+      // Find the consensus data for the txid
+      const consensusData = updatedState.aggregatedConsensusData.find(data => {
+        return Buffer.from(data.txid).equals(Buffer.from(txidByteArray));
+      });
 
       if (consensusData) {
         const consensusStatusIndex = consensusData.statusWeights.indexOf(Math.max(...consensusData.statusWeights));
