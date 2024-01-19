@@ -3,7 +3,6 @@ import { Program, web3, AnchorProvider, BN} from '@coral-xyz/anchor';
 import { SolanaPastelOracleProgram, IDL} from '../target/types/solana_pastel_oracle_program';
 import { assert } from 'chai';
 import * as crypto from 'crypto';
-import bs58 from 'bs58';
 const { ComputeBudgetProgram, Transaction } = anchor.web3;
 
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";

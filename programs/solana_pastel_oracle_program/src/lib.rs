@@ -218,10 +218,18 @@ fn calculate_consensus_and_cleanup(
 ) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
+    // Log the size of the OracleContractState account
+    let state_size = std::mem::size_of_val(state);
+    msg!("Size of OracleContractState account: {} bytes", state_size);
+
     // Filter reports for the specific txid
     let relevant_reports: Vec<&PastelTxStatusReport> = state.temp_tx_status_reports.iter()
         .filter(|report| report.txid == txid)
         .collect();
+
+    // Log the size of the temp_tx_status_reports vector
+    let temp_reports_size = state.temp_tx_status_reports.len();
+    msg!("Number of entries in temp_tx_status_reports: {}", temp_reports_size);
 
     // Compute consensus from the filtered reports
     let (consensus_status, consensus_hash) = compute_consensus_from_temp_reports(&relevant_reports);
