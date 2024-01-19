@@ -45,8 +45,6 @@ pub enum OracleError {
     InvalidTxidStatus,
     InvalidPastelTicketType,
     ContributorNotRegisteredOrBanned,
-    ReportReinitializationDetected,
-    ReportAccountNotWritable,
 }
 
 impl From<OracleError> for ProgramError {
@@ -190,6 +188,78 @@ pub fn get_report_account_pda(
     Pubkey::find_program_address(&[seed_hash.as_ref()], program_id)
 }
 
+fn compute_consensus_from_temp_reports(reports: &[&PastelTxStatusReport]) -> (TxidStatus, String) {
+    let mut status_weights = [0; TXID_STATUS_VARIANT_COUNT];
+    let mut hash_weights: Vec<(String, i32)> = Vec::new();
+
+    for report in reports {
+        status_weights[report.txid_status as usize] += 1;  // Increment weight for the status
+
+        let hash = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.clone().unwrap_or_default();
+        match hash_weights.iter_mut().find(|(h, _)| *h == hash) {
+            Some((_, weight)) => *weight += 1,
+            None => hash_weights.push((hash, 1)),
+        }
+    }
+
+    let consensus_status = status_weights.iter().enumerate().max_by_key(|&(_, weight)| weight)
+        .map(|(index, _)| usize_to_txid_status(index).unwrap_or(TxidStatus::Invalid)).unwrap();
+
+    let consensus_hash = hash_weights.into_iter().max_by_key(|(_, weight)| *weight)
+    .map(|(hash, _)| hash).unwrap_or_default();
+
+    (consensus_status, consensus_hash)
+}
+
+
+fn calculate_consensus_and_cleanup(
+    state: &mut OracleContractState, 
+    txid: &str,
+) -> Result<()> {
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+
+    // Filter reports for the specific txid
+    let relevant_reports: Vec<&PastelTxStatusReport> = state.temp_tx_status_reports.iter()
+        .filter(|report| report.txid == txid)
+        .collect();
+
+    // Compute consensus from the filtered reports
+    let (consensus_status, consensus_hash) = compute_consensus_from_temp_reports(&relevant_reports);
+
+    // Update contributors' scores
+    let mut contributor_count = 0;
+    for report in &relevant_reports {
+        if let Some(contributor) = state.contributors.iter_mut().find(|c| c.reward_address == report.contributor_reward_address) {
+            let is_accurate = report.txid_status == consensus_status &&
+                            report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
+            if is_accurate {
+                contributor_count += 1;
+            }
+            update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
+        }
+    }
+
+    // Log consensus details
+    msg!("Consensus Reached: TXID: {}, Status: {:?}, Hash: {}, Contributors: {}", txid, consensus_status, consensus_hash, contributor_count);
+
+    emit!(ConsensusReachedEvent {
+        txid: txid.to_string(),
+        status: format!("{:?}", consensus_status),
+        hash: consensus_hash,
+        number_of_contributors_included: contributor_count as u32,
+    });
+
+    state.assess_and_apply_bans(current_timestamp);
+    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
+
+    // Cleanup: Remove processed entries from temp_tx_status_reports
+    state.temp_tx_status_reports.retain(|report| {
+        report.txid != txid && current_timestamp - report.timestamp <= DATA_RETENTION_PERIOD
+    });
+
+    Ok(())
+}
+
 
 pub fn submit_data_report_helper(
     ctx: Context<SubmitDataReport>, 
@@ -197,27 +267,34 @@ pub fn submit_data_report_helper(
     report: PastelTxStatusReport,
     contributor_reward_address: Pubkey
 ) -> ProgramResult {
-    let state = &mut ctx.accounts.oracle_contract_state;
-    
+
+    // Validate the data report before any processing
     validate_data_contributor_report(&report)?;
-
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
-
-    // Temporarily store necessary data from state
-    let (compliance_score, is_banned) = if let Some(contributor) = state.contributors.iter().find(|c| c.reward_address == contributor_reward_address) {
-        (contributor.compliance_score, contributor.calculate_is_banned(current_timestamp))
-    } else {
-        return Err(OracleError::ContributorNotRegisteredOrBanned.into());
-    };
+    
+    // First, handle the immutable borrow
+    let compliance_score;
+    let is_banned;
+    {
+        let state = &ctx.accounts.oracle_contract_state;
+        if let Some(contributor) = state.contributors.iter().find(|c| c.reward_address == contributor_reward_address) {
+            compliance_score = contributor.compliance_score;
+            is_banned = contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64);
+        } else {
+            return Err(OracleError::ContributorNotRegisteredOrBanned.into());
+        }
+    }
 
     // Early return if the contributor is banned
     if is_banned {
         return Err(OracleError::ContributorNotRegisteredOrBanned.into());
     }
 
-    if !ctx.accounts.report_account.report.txid.is_empty() && ctx.accounts.report_account.report.txid != txid {
-        return Err(OracleError::ReportReinitializationDetected.into());
-    }
+    // Now handle the mutable borrow
+    let state = &mut ctx.accounts.oracle_contract_state;
+
+    
+    msg!("Adding new Data Report to contract state: {:?}", report);
+    state.temp_tx_status_reports.push(report.clone());
 
     ctx.accounts.report_account.report = report.clone();
     update_submission_count(state, &txid)?;
@@ -225,7 +302,7 @@ pub fn submit_data_report_helper(
     let weight = normalize_compliance_score(compliance_score) as u32;
     aggregate_consensus_data(state, &report, weight, &txid)?;
     if should_calculate_consensus(state, &txid)? {
-        calculate_consensus_and_cleanup(ctx.program_id, &ctx.remaining_accounts, state, &txid)?;
+        calculate_consensus_and_cleanup(state, &txid)?;
     }
 
     cleanup_old_submission_counts(state)?;
@@ -366,6 +443,7 @@ pub struct OracleContractState {
     pub fee_receiving_contract_nonce: u8,
     pub bridge_contract_pubkey: Pubkey,
     pub active_reliable_contributors_count: u32,
+    pub temp_tx_status_reports: Vec<PastelTxStatusReport>,
 }
 
 
@@ -915,73 +993,6 @@ pub struct ConsensusReachedEvent {
     pub status: String,
     pub hash: String,
     pub number_of_contributors_included: u32,
-}
-
-
-fn calculate_consensus_and_cleanup(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    state: &mut OracleContractState, 
-    txid: &str,
-) -> Result<()> {
-    let aggregated_data = state.aggregated_consensus_data.iter()
-        .find(|data| data.txid == txid)
-        .ok_or(OracleError::InvalidTxid)?;
-    msg!("Aggregated Data Found for TXID: {}", txid);
-
-    let max_weight = aggregated_data.status_weights.iter().max().unwrap_or(&0);
-    let consensus_status_index = aggregated_data.status_weights.iter().position(|&w| w == *max_weight).unwrap_or(0);
-    let consensus_status = usize_to_txid_status(consensus_status_index).unwrap_or(TxidStatus::Invalid);
-    msg!("Consensus Status: {:?}, Max Weight: {}", consensus_status, max_weight);
-
-    let consensus_hash = aggregated_data.hash_weights.iter()
-        .max_by_key(|hash_weight| hash_weight.weight)
-        .map(|hash_weight| hash_weight.hash.clone())
-        .unwrap_or_default();
-    msg!("Consensus Hash: {}", consensus_hash);
-
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
-    let mut contributor_count = 0;
-
-    for contributor in state.contributors.iter_mut().filter(|c| c.ban_expiry <= current_timestamp) {
-        msg!("Checking submission from Contributor: {}", contributor.reward_address);
-
-        let (pda, _bump_seed) = get_report_account_pda(program_id, txid, &contributor.reward_address);
-        if let Some(report_account_info) = accounts.iter().find(|&account| *account.key == pda) {
-            if !report_account_info.is_writable || *report_account_info.owner != *program_id {
-                return Err(OracleError::ReportAccountNotWritable.into());
-            }
-
-            if let Ok(report_account) = PastelTxStatusReportAccount::try_from_slice(&report_account_info.data.borrow()) {
-                if report_account.report.txid == txid {
-                    let is_accurate = report_account.report.txid_status == consensus_status &&
-                                    report_account.report.first_6_characters_of_sha3_256_hash_of_corresponding_file
-                                        .as_ref()
-                                        .map_or(false, |hash| hash == &consensus_hash);
-                    if is_accurate {
-                        contributor_count += 1;
-                    }
-                    update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
-                }
-            } else {
-                return Err(OracleError::InvalidTxid.into());
-            }
-        }
-    }
-
-    msg!("Consensus Reached: TXID: {}, Status: {:?}, Hash: {}, Contributors: {}", txid, consensus_status, consensus_hash, contributor_count);
-
-    emit!(ConsensusReachedEvent {
-        txid: txid.to_string(),
-        status: format!("{:?}", consensus_status),
-        hash: consensus_hash,
-        number_of_contributors_included: contributor_count as u32,
-    });
-
-    state.assess_and_apply_bans(current_timestamp);
-    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
-
-    Ok(())
 }
 
 

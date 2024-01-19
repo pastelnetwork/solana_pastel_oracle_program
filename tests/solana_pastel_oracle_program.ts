@@ -22,7 +22,7 @@ const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_REPORTS_FOR_REWARD = 10;
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
-const maxSize = 200 * 1024; // 200KB
+const maxSize = 800 * 1024; // 200KB
 
 const TxidStatusEnum = {
   Invalid: "Invalid",
@@ -280,15 +280,15 @@ describe('Data Report Submission', () => {
         console.log(`Status value for TXID ${txid} by contributor ${contributor.publicKey.toBase58()} is '${txidStatusValue}'; ticket type value is '${pastelTicketTypeValue}'`);
 
         const preimageString = seedPreamble + txid + rewardAddress.toBase58();
-        console.log(`Preimage string for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, preimageString);
+        // console.log(`Preimage string for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, preimageString);
 
         const preimageBytes = Buffer.from(preimageString, 'utf8');
         
         const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
-        console.log(`Seed hash for PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, bs58.encode(seedHash));
+        // console.log(`Seed hash for PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, bs58.encode(seedHash));
         
         const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
-        console.log(`Report account PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, reportAccountPDA.toBase58());
+        // console.log(`Report account PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, reportAccountPDA.toBase58());
 
 
         // Create and send the transaction
