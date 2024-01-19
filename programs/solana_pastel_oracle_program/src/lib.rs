@@ -20,7 +20,15 @@ const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSE
 const DATA_RETENTION_PERIOD: u64 = 3 * 24 * 60 * 60; // How long to keep data in the contract state (3 days)
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
+
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
+const MAX_CONTRIBUTORS: usize = 200; // Adjust as needed
+const MAX_TXID_SUBMISSION_COUNTS: usize = 1000; // Adjust as needed
+const MAX_MONITORED_TXIDS: usize = 1000; // Adjust as needed
+const MAX_AGGREGATED_CONSENSUS_DATA: usize = 1000; // Adjust as needed
+const MAX_TEMP_TX_STATUS_REPORTS: usize = 1000; // Adjust as needed
+const MAX_HASH_WEIGHTS: usize = 5000; // Adjust this number based on your needs
+const TRANSACTION_SIGNATURE_LENGTH: usize = 64; // Adjust as needed
 
 #[error_code]
 pub enum OracleError {
@@ -67,10 +75,17 @@ pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> 
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum TxidStatus {
+    PlaceholderValue,    
     Invalid,
     PendingMining,
     MinedPendingActivation,
     MinedActivated,
+}
+
+impl Default for TxidStatus {
+    fn default() -> Self {
+        TxidStatus::PlaceholderValue
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
@@ -81,26 +96,157 @@ pub enum PastelTicketType {
     InferenceApi,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
+
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize, Copy)]
+pub struct Contributor {
+    pub reward_address: Pubkey,
+    pub registration_entrance_fee_transaction_signature: [u8; TRANSACTION_SIGNATURE_LENGTH],
+    pub compliance_score: i32,
+    pub last_active_timestamp: u64,
+    pub total_reports_submitted: u32,
+    pub accurate_reports_count: u32,
+    pub current_streak: u32,
+    pub reliability_score: u32,
+    pub consensus_failures: u32,
+    pub ban_expiry: u64,
+    pub is_eligible_for_rewards: bool,
+    pub is_recently_active: bool,
+    pub is_reliable: bool,    
+}
+
+impl Default for Contributor {
+    fn default() -> Self {
+        Self {
+            reward_address: Pubkey::default(),
+            registration_entrance_fee_transaction_signature: [0u8; TRANSACTION_SIGNATURE_LENGTH],
+            compliance_score: 0,
+            last_active_timestamp: 0,
+            total_reports_submitted: 0,
+            accurate_reports_count: 0,
+            current_streak: 0,
+            reliability_score: 0,
+            consensus_failures: 0,
+            ban_expiry: 0,
+            is_eligible_for_rewards: false,
+            is_recently_active: false,
+            is_reliable: false,
+        }
+    }
+}
+
+#[account]
+pub struct OracleContractState {
+    pub is_initialized: bool,
+    pub admin_pubkey: Pubkey,
+    pub contributors: [Contributor; MAX_CONTRIBUTORS],
+    pub txid_submission_counts: [TxidSubmissionCount; MAX_TXID_SUBMISSION_COUNTS],
+    pub monitored_txids: [[u8; MAX_TXID_LENGTH]; MAX_MONITORED_TXIDS],
+    pub aggregated_consensus_data: [AggregatedConsensusData; MAX_AGGREGATED_CONSENSUS_DATA],
+    pub reward_pool_account: Pubkey,
+    pub reward_pool_nonce: u8,
+    pub fee_receiving_contract_account: Pubkey,
+    pub fee_receiving_contract_nonce: u8,
+    pub bridge_contract_pubkey: Pubkey,
+    pub active_reliable_contributors_count: u32,
+    pub temp_tx_status_reports: [PastelTxStatusReport; MAX_TEMP_TX_STATUS_REPORTS],
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize, Copy)]
 pub struct PastelTxStatusReport {
-    pub txid: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid
     pub txid_status: TxidStatus,
     pub pastel_ticket_type: Option<PastelTicketType>,
-    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: Option<String>,
+    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: Option<[u8; 6]>, // Using 6 bytes for the hash segment
     pub timestamp: u64,
     pub contributor_reward_address: Pubkey,
 }
 
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+
+impl Default for PastelTxStatusReport {
+    fn default() -> Self {
+        Self {
+            txid: [0u8; MAX_TXID_LENGTH],
+            txid_status: TxidStatus::default(), // Assuming TxidStatus implements Default
+            pastel_ticket_type: None,
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: None,
+            timestamp: 0,
+            contributor_reward_address: Pubkey::default(), // Assuming Pubkey implements Default
+        }
+    }
+}
+
+// Functions to convert between Strings and byte arrays
+impl PastelTxStatusReport {
+    fn new(txid: &str, txid_status: TxidStatus, pastel_ticket_type: Option<PastelTicketType>, hash_segment: Option<&str>, timestamp: u64, contributor_reward_address: Pubkey) -> Self {
+        Self {
+            txid: Self::string_to_fixed_array(txid),
+            txid_status,
+            pastel_ticket_type,
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: hash_segment.map(Self::string_to_fixed_array_6),
+            timestamp,
+            contributor_reward_address,
+        }
+    }
+
+    fn string_to_fixed_array(s: &str) -> [u8; MAX_TXID_LENGTH] {
+        let mut array = [0u8; MAX_TXID_LENGTH];
+        let bytes = s.as_bytes();
+        array[..bytes.len()].copy_from_slice(bytes);
+        array
+    }
+
+    fn string_to_fixed_array_6(s: &str) -> [u8; 6] {
+        let mut array = [0u8; 6];
+        let bytes = s.as_bytes();
+        array[..bytes.len()].copy_from_slice(bytes);
+        array
+    }
+
+    // Check if the report is empty (i.e., uninitialized or default state)
+    pub fn is_empty(&self) -> bool {
+        self.txid == [0u8; MAX_TXID_LENGTH]
+    }    
+}
+
+
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize, Copy)]
 pub struct TxidSubmissionCount {
-    pub txid: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid
     pub count: u32,
     pub last_updated: u64,
 }
 
+impl TxidSubmissionCount {
+    fn new(txid: &str, count: u32, last_updated: u64) -> Self {
+        Self {
+            txid: Self::string_to_fixed_array(txid),
+            count,
+            last_updated,
+        }
+    }
+
+    fn string_to_fixed_array(s: &str) -> [u8; MAX_TXID_LENGTH] {
+        let mut array = [0u8; MAX_TXID_LENGTH];
+        let bytes = s.as_bytes();
+        array[..bytes.len()].copy_from_slice(bytes);
+        array
+    }
+}
+
+impl Default for TxidSubmissionCount {
+    fn default() -> Self {
+        Self {
+            txid: [0u8; MAX_TXID_LENGTH], // Default value for txid
+            count: 0,
+            last_updated: 0,
+        }
+    }
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub struct PendingPayment {
-    pub txid: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
     pub expected_amount: u64,
     pub payment_status: PaymentStatus,
 }
@@ -150,28 +296,44 @@ pub struct SubmitDataReport<'info> {
 #[event]
 pub struct DataReportSubmitted {
     pub contributor: Pubkey,
-    pub txid: String,
-    pub status: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
+    pub status: TxidStatus,
     pub timestamp: u64,
 }
 
 
-fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
+fn update_submission_count(state: &mut OracleContractState, txid: [u8; MAX_TXID_LENGTH]) -> Result<()> {
     // Get the current timestamp
     let current_timestamp_u64 = Clock::get()?.unix_timestamp as u64;
 
-    // Check if the txid already exists in the submission counts
-    if let Some(count) = state.txid_submission_counts.iter_mut().find(|c| c.txid == txid) {
-        // Update the existing count
-        count.count += 1;
-        count.last_updated = current_timestamp_u64;
-    } else {
-        // Insert a new count if the txid does not exist
-        state.txid_submission_counts.push(TxidSubmissionCount {
-            txid: txid.to_string(),
-            count: 1,
-            last_updated: current_timestamp_u64,
-        });
+    // Initialize a flag to track if txid was found
+    let mut found = false;
+
+    // Iterate over txid_submission_counts to find or create a submission count
+    for count in state.txid_submission_counts.iter_mut() {
+        // Check if this entry is the one we're looking for
+        if count.txid == txid {
+            // Update the existing count
+            count.count += 1;
+            count.last_updated = current_timestamp_u64;
+            found = true;
+            break;
+        }
+    }
+
+    // If the txid was not found, look for an empty slot to add a new entry
+    if !found {
+        if let Some(count) = state.txid_submission_counts.iter_mut().find(|c| c.txid == [0u8; MAX_TXID_LENGTH]) {
+            // Found an empty slot, insert the new count
+            *count = TxidSubmissionCount {
+                txid,
+                count: 1,
+                last_updated: current_timestamp_u64,
+            };
+        } else {
+            // No empty slots found, return an error
+            return Err(OracleError::MemoryAllocationFailed.into());
+        }
     }
 
     Ok(())
@@ -180,42 +342,51 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
 
 pub fn get_report_account_pda(
     program_id: &Pubkey, 
-    txid: &str, 
+    txid: &[u8; MAX_TXID_LENGTH], 
     contributor_reward_address: &Pubkey
 ) -> (Pubkey, u8) {
-    msg!("get_report_account_pda: program_id: {}, txid: {}, contributor_reward_address: {}", program_id, txid, contributor_reward_address);
-    let seed_hash = create_seed("pastel_tx_status_report", txid, contributor_reward_address);
+    // Convert the byte array txid to a string
+    let txid_str = String::from_utf8_lossy(txid);
+
+    msg!("get_report_account_pda: program_id: {}, txid: {}, contributor_reward_address: {}", program_id, txid_str, contributor_reward_address);
+    // Use the string representation of txid for seed generation
+    let seed_hash = create_seed("pastel_tx_status_report", &txid_str, contributor_reward_address);
     msg!("get_report_account_pda: seed_hash: {:?}", seed_hash);
+
     Pubkey::find_program_address(&[seed_hash.as_ref()], program_id)
 }
 
-
-fn get_aggregated_data<'a>(state: &'a OracleContractState, txid: &str) -> Option<&'a AggregatedConsensusData> {
+fn get_aggregated_data<'a>(state: &'a OracleContractState, txid: &[u8; MAX_TXID_LENGTH]) -> Option<&'a AggregatedConsensusData> {
     state.aggregated_consensus_data.iter()
-        .find(|data| data.txid == txid)
+        .find(|data| data.txid == *txid)
 }
 
-
-fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
+fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, [u8; 6]) {
     let consensus_status = aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, weight)| weight)
         .map(|(index, _)| usize_to_txid_status(index).unwrap_or(TxidStatus::Invalid)).unwrap();
 
     let consensus_hash = aggregated_data.hash_weights.iter().max_by_key(|hash_weight| hash_weight.weight)
-        .map(|hash_weight| hash_weight.hash.clone()).unwrap_or_default();
+        .map(|hash_weight| hash_weight.hash.unwrap_or([0u8; 6])) // Return the hash array or a default one if not present
+        .unwrap_or([0u8; 6]);
 
     (consensus_status, consensus_hash)
 }
 
+// Function to convert a byte array to a hex string
+fn bytes_to_hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
 
 fn calculate_consensus_and_cleanup(
-    state: &mut OracleContractState, 
-    txid: &str,
+    state: &mut OracleContractState,
+    txid: [u8; MAX_TXID_LENGTH],
 ) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    let (consensus_status, consensus_hash) = get_aggregated_data(state, txid)
+    // Assuming `get_aggregated_data` and `compute_consensus` are updated to work with the new data types
+    let (consensus_status, consensus_hash) = get_aggregated_data(state, &txid)
         .map(|data| compute_consensus(data))
-        .unwrap_or((TxidStatus::Invalid, String::new()));
+        .unwrap_or((TxidStatus::Invalid, [0u8; 6])); // Replace String::new() with a default hash array
 
     let mut updated_contributors = Vec::new();
     let mut contributor_count = 0;
@@ -224,79 +395,132 @@ fn calculate_consensus_and_cleanup(
         if report.txid == txid && !updated_contributors.contains(&report.contributor_reward_address) {
             if let Some(contributor) = state.contributors.iter_mut().find(|c| c.reward_address == report.contributor_reward_address) {
                 let is_accurate = report.txid_status == consensus_status &&
-                    report.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
+                    report.first_6_characters_of_sha3_256_hash_of_corresponding_file.map_or(false, |hash| hash == consensus_hash);
                 update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
                 updated_contributors.push(report.contributor_reward_address);
             }
             contributor_count += 1;
         }
     }
-    // Log consensus details
-    msg!("Consensus Reached: TXID: {}, Status: {:?}, Hash: {}, Contributors: {}", txid, consensus_status, consensus_hash, contributor_count);
+
+    // Convert txid to string for logging
+    let txid_str = String::from_utf8_lossy(&txid);
+    msg!("Consensus Reached: TXID: {}, Status: {:?}, Hash: {:?}, Contributors: {}", txid_str, consensus_status, consensus_hash, contributor_count);
 
     emit!(ConsensusReachedEvent {
-        txid: txid.to_string(),
-        status: format!("{:?}", consensus_status),
-        hash: consensus_hash,
+        txid,
+        status: consensus_status,
+        hash: Some(consensus_hash),
         number_of_contributors_included: contributor_count as u32,
     });
     state.assess_and_apply_bans(current_timestamp);
 
-    msg!("Size of temp_tx_status_reports before pruning: {}", state.temp_tx_status_reports.len());
-    msg!("Size of aggregated_consensus_data before pruning: {}", state.aggregated_consensus_data.len());
+    // Pruning logic for fixed-size arrays
+    let mut new_temp_tx_status_reports = [PastelTxStatusReport::default(); MAX_TEMP_TX_STATUS_REPORTS];
+    let mut new_aggregated_consensus_data = [AggregatedConsensusData::default(); MAX_AGGREGATED_CONSENSUS_DATA];
 
-    // Cleanup: Remove processed entries from temp_tx_status_reports related to the current txid
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
-    state.temp_tx_status_reports.retain(|report| 
-        report.txid != txid && current_timestamp - report.timestamp < DATA_RETENTION_PERIOD
-    );
+    let mut new_report_count = 0;
+    let mut new_aggregated_count = 0;
 
-    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
-    msg!("Size of temp_tx_status_reports after pruning: {}", state.temp_tx_status_reports.len());
-    msg!("Size of aggregated_consensus_data after pruning: {}", state.aggregated_consensus_data.len());
+    // Retain logic for temp_tx_status_reports
+    for report in state.temp_tx_status_reports.iter() {
+        if report.txid != txid && current_timestamp - report.timestamp < DATA_RETENTION_PERIOD {
+            new_temp_tx_status_reports[new_report_count] = *report;
+            new_report_count += 1;
+        }
+    }
+
+    // Retain logic for aggregated_consensus_data
+    for data in state.aggregated_consensus_data.iter() {
+        if current_timestamp - data.last_updated < DATA_RETENTION_PERIOD {
+            new_aggregated_consensus_data[new_aggregated_count] = *data;
+            new_aggregated_count += 1;
+        }
+    }
+
+    state.temp_tx_status_reports = new_temp_tx_status_reports;
+    state.aggregated_consensus_data = new_aggregated_consensus_data;
 
     Ok(())
 }
 
 
-fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxStatusReport, weight: u32, txid: &str) -> Result<()> {
+// Function to update hash weight in a fixed-size array
+fn update_hash_weight_fixed_array(hash_weights: &mut [HashWeight; MAX_HASH_WEIGHTS], hash: &[u8; 6], weight: i32) {
+    let mut found = false;
+
+    for hash_weight in hash_weights.iter_mut() {
+        if hash_weight.hash == Some(*hash) {
+            hash_weight.weight += weight;
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        add_hash_weight_fixed_array(hash_weights, hash, weight);
+    }
+}
+
+// Function to add a new hash weight in the first empty slot of the fixed-size array
+fn add_hash_weight_fixed_array(hash_weights: &mut [HashWeight; MAX_HASH_WEIGHTS], hash: &[u8; 6], weight: i32) {
+    for hash_weight in hash_weights.iter_mut() {
+        if hash_weight.is_empty() {
+            *hash_weight = HashWeight { hash: Some(*hash), weight };
+            break;
+        }
+    }
+}
+
+fn aggregate_consensus_data(
+    state: &mut OracleContractState,
+    report: &PastelTxStatusReport,
+    weight: u32,
+    txid: [u8; MAX_TXID_LENGTH],
+) -> Result<()> {
     let weight_i32 = weight as i32;
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    let data = state.aggregated_consensus_data.iter_mut().find(|d| d.txid == txid);
-
-    if let Some(data_entry) = data {
-        // Update existing data
-        data_entry.status_weights[report.txid_status as usize] += weight_i32;
-        if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            update_hash_weight(&mut data_entry.hash_weights, hash, weight_i32);
+    let mut data_found = false;
+    for data_entry in &mut state.aggregated_consensus_data {
+        if data_entry.txid == txid {
+            // Update existing data
+            data_entry.status_weights[report.txid_status as usize] += weight_i32;
+            if let Some(hash) = report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
+                // Update or add new hash weight
+                update_hash_weight_fixed_array(&mut data_entry.hash_weights, &hash, weight_i32);
+            }
+            data_entry.last_updated = current_timestamp;
+            data_found = true;
+            break;
         }
-        data_entry.last_updated = current_timestamp;
-    } else {
-        // Dynamically determine additional capacity needed
-        let additional_capacity = 1; // Assuming each new data typically requires space for one element
-        let max_capacity = 32 * 1024 / std::mem::size_of::<AggregatedConsensusData>(); // Calculate the maximum possible number of elements
+    }
 
-        if state.aggregated_consensus_data.len() + additional_capacity > max_capacity {
-            // Handle the case where we are at or near maximum capacity
+    if !data_found {
+        // Find an empty slot or placeholder in the fixed-size array
+        let mut slot_found = false;
+        for data_entry in &mut state.aggregated_consensus_data {
+            if data_entry.is_empty() {
+                *data_entry = AggregatedConsensusData {
+                    txid,
+                    status_weights: [0; TXID_STATUS_VARIANT_COUNT],
+                    hash_weights: [HashWeight::default(); MAX_HASH_WEIGHTS],
+                    last_updated: current_timestamp,
+                };
+                data_entry.status_weights[report.txid_status as usize] += weight_i32;
+                if let Some(hash) = report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
+                    // Add hash weight to the first empty slot
+                    add_hash_weight_fixed_array(&mut data_entry.hash_weights, &hash, weight_i32);
+                }
+                slot_found = true;
+                break;
+            }
+        }
+
+        if !slot_found {
+            msg!("Failed to aggregate consensus data: No available slot in aggregated_consensus_data");
             return Err(OracleError::MemoryAllocationFailed.into());
-        } else if state.aggregated_consensus_data.len() == state.aggregated_consensus_data.capacity() {
-            // Only reserve additional capacity if needed
-            state.aggregated_consensus_data.reserve(additional_capacity);
         }
-
-        // Create new data
-        let mut new_data = AggregatedConsensusData {
-            txid: txid.to_string(),
-            status_weights: [0; TXID_STATUS_VARIANT_COUNT],
-            hash_weights: Vec::new(),
-            last_updated: current_timestamp,
-        };
-        new_data.status_weights[report.txid_status as usize] += weight_i32;
-        if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            new_data.hash_weights.push(HashWeight { hash: hash.clone(), weight: weight_i32 });
-        }
-        state.aggregated_consensus_data.push(new_data);
     }
 
     Ok(())
@@ -305,7 +529,7 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
 
 pub fn submit_data_report_helper(
     ctx: Context<SubmitDataReport>, 
-    txid: String, 
+    txid: [u8; MAX_TXID_LENGTH], 
     report: PastelTxStatusReport,
     contributor_reward_address: Pubkey
 ) -> ProgramResult {
@@ -334,17 +558,34 @@ pub fn submit_data_report_helper(
     let state = &mut ctx.accounts.oracle_contract_state;
 
     msg!("Adding new Data Report to contract state: {:?}", report);
-    state.temp_tx_status_reports.push(report.clone());
+
+    // Handle adding the report to temp_tx_status_reports (assuming it's now a fixed-size array)
+    let report_added = {
+        let mut added = false;
+        for existing_report in state.temp_tx_status_reports.iter_mut() {
+            if existing_report.is_empty() { // is_empty method checks for a default/empty report
+                *existing_report = report.clone();
+                added = true;
+                break;
+            }
+        }
+        added
+    };
+
+    if !report_added {
+        msg!("Failed to add new report: No available space in temp_tx_status_reports");
+        return Err(OracleError::MemoryAllocationFailed.into());
+    }
 
     ctx.accounts.report_account.report = report.clone();
-    update_submission_count(state, &txid)?;
+    update_submission_count(state, txid)?;
 
     msg!("New size of temp_tx_status_reports in bytes: {}", state.temp_tx_status_reports.len() * std::mem::size_of::<PastelTxStatusReport>());
 
     let weight = normalize_compliance_score(compliance_score) as u32;
-    aggregate_consensus_data(state, &report, weight, &txid)?;
-    if should_calculate_consensus(state, &txid)? {
-        calculate_consensus_and_cleanup(state, &txid)?;
+    aggregate_consensus_data(state, &report, weight, txid)?;
+    if should_calculate_consensus(state, txid)? {
+        calculate_consensus_and_cleanup(state, txid)?;
     }
     cleanup_old_submission_counts(state)?;
     
@@ -393,7 +634,7 @@ pub struct HandlePendingPayment<'info> {
 
 pub fn add_pending_payment_helper(
     ctx: Context<HandlePendingPayment>, 
-    txid: String, 
+    txid: [u8; MAX_TXID_LENGTH], // Accepting txid as [u8; 64]
     pending_payment: PendingPayment
 ) -> ProgramResult {
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
@@ -411,47 +652,15 @@ pub fn add_pending_payment_helper(
     // Store the pending payment in the account
     pending_payment_account.pending_payment = pending_payment;
 
+    // Convert txid to String for logging
+    let txid_str = String::from_utf8_lossy(&txid);
+
     msg!("Pending payment account initialized: TXID: {}, Expected Amount: {}, Status: {:?}", 
-        pending_payment_account.pending_payment.txid, 
+        txid_str, 
         pending_payment_account.pending_payment.expected_amount, 
         pending_payment_account.pending_payment.payment_status);
 
     Ok(())
-}
-
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
-pub struct Contributor {
-    pub reward_address: Pubkey,
-    pub registration_entrance_fee_transaction_signature: String,
-    pub compliance_score: i32,
-    pub last_active_timestamp: u64,
-    pub total_reports_submitted: u32,
-    pub accurate_reports_count: u32,
-    pub current_streak: u32,
-    pub reliability_score: u32,
-    pub consensus_failures: u32,
-    pub ban_expiry: u64,
-    pub is_eligible_for_rewards: bool,
-    pub is_recently_active: bool,
-    pub is_reliable: bool,    
-}
-
-
-#[account]
-pub struct OracleContractState {
-    pub is_initialized: bool,
-    pub admin_pubkey: Pubkey,
-    pub contributors: Vec<Contributor>,
-    pub txid_submission_counts: Vec<TxidSubmissionCount>,
-    pub monitored_txids: Vec<String>,
-    pub aggregated_consensus_data: Vec<AggregatedConsensusData>,
-    pub reward_pool_account: Pubkey,
-    pub reward_pool_nonce: u8,
-    pub fee_receiving_contract_account: Pubkey,
-    pub fee_receiving_contract_nonce: u8,
-    pub bridge_contract_pubkey: Pubkey,
-    pub active_reliable_contributors_count: u32,
-    pub temp_tx_status_reports: Vec<PastelTxStatusReport>,
 }
 
 
@@ -499,17 +708,19 @@ impl<'info> Initialize<'info> {
         state.admin_pubkey = admin_pubkey;
         msg!("Admin Pubkey set to: {:?}", admin_pubkey);
 
-        state.contributors = Vec::new();
-        msg!("Contributors Vector initialized");
 
-        state.txid_submission_counts = Vec::new();
-        msg!("Txid Submission Counts Vector initialized");
+        // Initialize arrays with default values
+        state.contributors = [Contributor::default(); MAX_CONTRIBUTORS];
+        msg!("Contributors array initialized");
 
-        state.monitored_txids = Vec::new();
-        msg!("Monitored Txids Vector initialized");
+        state.txid_submission_counts = [TxidSubmissionCount::default(); MAX_TXID_SUBMISSION_COUNTS];
+        msg!("Txid Submission Counts array initialized");
 
-        state.aggregated_consensus_data = Vec::new();
-        msg!("Aggregated Consensus Data Vector initialized");
+        state.monitored_txids = [[0u8; MAX_TXID_LENGTH]; MAX_MONITORED_TXIDS];
+        msg!("Monitored Txids array initialized");
+
+        state.aggregated_consensus_data = [AggregatedConsensusData::default(); MAX_AGGREGATED_CONSENSUS_DATA];
+        msg!("Aggregated Consensus Data array initialized");
 
         state.bridge_contract_pubkey = Pubkey::default();
         msg!("Bridge Contract Pubkey set to default");
@@ -551,18 +762,25 @@ impl<'info> ReallocateOracleState<'info> {
 }
 
 
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize, Default, Copy)]
 pub struct HashWeight {
-    pub hash: String,
+    pub hash: Option<[u8; 6]>, // Using 6 bytes for the hash segment,
     pub weight: i32,
 }
 
+impl HashWeight {
+    // Check if the HashWeight is empty (default state)
+    fn is_empty(&self) -> bool {
+        self.hash.is_none() && self.weight == 0
+    }
+}
+
 // Function to update hash weight
-fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i32) {
+fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: [u8; 6], weight: i32) {
     let mut found = false;
 
     for hash_weight in hash_weights.iter_mut() {
-        if hash_weight.hash.as_str() == hash {
+        if hash_weight.hash == Some(hash) {
             hash_weight.weight += weight;
             found = true;
             break;
@@ -571,19 +789,40 @@ fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i3
 
     if !found {
         hash_weights.push(HashWeight {
-            hash: hash.to_string(), // Clone only when necessary
+            hash: Some(hash),
             weight,
         });
     }
 }
 
 // Struct to hold aggregated data for consensus calculation
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize, Copy)]
 pub struct AggregatedConsensusData {
-    pub txid: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
-    pub hash_weights: Vec<HashWeight>,
+    pub hash_weights: [HashWeight; MAX_HASH_WEIGHTS], // Fixed-size array
     pub last_updated: u64, // Unix timestamp indicating the last update time
+}
+
+impl AggregatedConsensusData {
+    pub fn is_empty(&self) -> bool {
+        self.txid == [0u8; MAX_TXID_LENGTH] &&
+        self.status_weights.iter().all(|&weight| weight == 0) &&
+        self.hash_weights.is_empty() &&
+        self.last_updated == 0
+    }
+}
+
+impl Default for AggregatedConsensusData {
+    fn default() -> Self {
+        Self {
+            txid: [0u8; MAX_TXID_LENGTH],
+            status_weights: [0; TXID_STATUS_VARIANT_COUNT],
+            hash_weights: [HashWeight::default(); MAX_HASH_WEIGHTS],
+            last_updated: 0,
+        }
+    }
 }
 
 #[derive(Accounts)]
@@ -733,7 +972,7 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     // Create and add the new contributor
     let new_contributor = Contributor {
         reward_address: *ctx.accounts.contributor_account.key,
-        registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
+        registration_entrance_fee_transaction_signature: [0; TRANSACTION_SIGNATURE_LENGTH],
         compliance_score: 0, // Initial compliance score
         last_active_timestamp, // Set the last active timestamp to the current time
         total_reports_submitted: 0, // Initially, no reports have been submitted
@@ -747,9 +986,20 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
         is_reliable: false, // Initially not considered reliable
     };
 
-    // Append the new contributor to the state
-    state.contributors.push(new_contributor);
+    // Find an empty slot in the contributors array to insert the new contributor
+    let mut inserted = false;
+    for contributor in state.contributors.iter_mut() {
+        if contributor.reward_address == Pubkey::default() { // Assumes default means uninitialized
+            *contributor = new_contributor;
+            inserted = true;
+            break;
+        }
+    }
 
+    if !inserted {
+        msg!("Registration failed: No available slot for new contributor");
+        return Err(OracleError::MemoryAllocationFailed.into());
+    }
     // Emit event for new contributor registration
     emit!(ContributorRegisteredEvent {
         address: *ctx.accounts.contributor_account.key,
@@ -884,7 +1134,7 @@ pub fn update_bans_and_statuses(contributor: &mut Contributor, current_timestamp
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct AddTxidForMonitoringData {
-    pub txid: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
 }
 
 #[derive(Accounts)]
@@ -907,7 +1157,7 @@ pub struct AddTxidForMonitoring<'info> {
 
 #[event]
 pub struct TxidAddedForMonitoringEvent {
-    pub txid: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
     pub expected_amount: u64,
 }
 
@@ -925,8 +1175,20 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
         return Err(OracleError::InvalidTxid.into());
     }
 
-    // Add the TXID to the monitored list
-    state.monitored_txids.push(txid.clone());
+    // Find an empty slot in the monitored_txids array to insert the new txid
+    let mut inserted = false;
+    for monitored_txid in state.monitored_txids.iter_mut() {
+        if monitored_txid.iter().all(|&byte| byte == 0) {
+            *monitored_txid = data.txid;
+            inserted = true;
+            break;
+        }
+    }
+
+    if !inserted {
+        msg!("No available slot to monitor new TXID");
+        return Err(OracleError::MemoryAllocationFailed.into());
+    }
 
     // Initialize pending_payment_account here using the txid
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
@@ -942,7 +1204,13 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
         expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
     });
 
-    msg!("Added Pastel TXID for Monitoring: {}", pending_payment_account.pending_payment.txid);
+    // Convert txid to UTF-8 string for logging, if possible
+    let txid_utf8 = match std::str::from_utf8(&data.txid) {
+        Ok(str) => str.to_string(),
+        Err(_) => "Invalid UTF-8".to_string(),
+    };
+    msg!("Added Pastel TXID for Monitoring: {}", txid_utf8);
+
     Ok(())
 }
 
@@ -958,10 +1226,10 @@ pub struct ProcessPastelTxStatusReport<'info> {
     // You can add other accounts as needed
 }
 
-pub fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Result<bool> {
+pub fn should_calculate_consensus(state: &OracleContractState, txid_bytes: [u8; MAX_TXID_LENGTH]) -> Result<bool> {
     // Retrieve the count of submissions and last updated timestamp for the given txid
     let (submission_count, last_updated) = state.txid_submission_counts.iter()
-        .find(|c| c.txid == txid)
+        .find(|c| c.txid == txid_bytes)
         .map(|c| (c.count, c.last_updated))
         .unwrap_or((0, 0));
 
@@ -987,9 +1255,15 @@ pub fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Re
 
 pub fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<()> {
     let current_time = Clock::get()?.unix_timestamp as u64;
-    state.txid_submission_counts.retain(|count| {
-        current_time - count.last_updated < SUBMISSION_COUNT_RETENTION_PERIOD
-    });
+    
+    for count in state.txid_submission_counts.iter_mut() {
+        // Check if the submission count is older than the retention period
+        if current_time - count.last_updated >= SUBMISSION_COUNT_RETENTION_PERIOD {
+            // Mark this count as invalid or reset its fields
+            *count = TxidSubmissionCount::default(); // Reset to default if it's no longer valid
+        }
+    }
+
     Ok(())
 }
 
@@ -1015,17 +1289,17 @@ pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
 
 #[event]
 pub struct ConsensusReachedEvent {
-    pub txid: String,
-    pub status: String,
-    pub hash: String,
+    pub txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid,
+    pub status: TxidStatus,
+    pub hash: Option<[u8; 6]>, // Using 6 bytes for the hash segment,
     pub number_of_contributors_included: u32,
 }
 
 
 // Function to handle the submission of Pastel transaction status reports
 pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()> {
-    // Direct return in case of invalid data, reducing nested if conditions
-    if report.txid.trim().is_empty() {
+    // Check if TXID is empty (i.e., all zeros)
+    if report.txid.iter().all(|&byte| byte == 0) {
         msg!("Error: InvalidTxid (TXID is empty)");
         return Err(OracleError::InvalidTxid.into());
     } 
@@ -1038,10 +1312,12 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
         msg!("Error: Missing Pastel Ticket Type");
         return Err(OracleError::MissingPastelTicketType.into());
     }
-    // Direct return in case of invalid hash, reducing nested if conditions
+    // Hash validation
     if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-        if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            msg!("Error: Invalid File Hash Length or Non-hex characters");
+        // Convert byte array to string for validation
+        let hash_string = std::str::from_utf8(hash).map_err(|_| OracleError::InvalidFileHashLength)?;
+        if !hash_string.chars().all(|c| c.is_ascii_hexdigit()) {
+            msg!("Error: Invalid File Hash (Non-hex characters)");
             return Err(OracleError::InvalidFileHashLength.into());
         }
     } else {
@@ -1054,13 +1330,23 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
 impl OracleContractState {
     pub fn assess_and_apply_bans(&mut self, current_time: u64) {
         for contributor in &mut self.contributors {
-            contributor.handle_consensus_failure(current_time);
+            if contributor.calculate_is_banned(current_time) {
+                // Replace banned contributors with a placeholder
+                *contributor = Contributor::default();
+            } else {
+                contributor.handle_consensus_failure(current_time);
+            }
         }
-        self.contributors.retain(|c| !c.calculate_is_banned(current_time));
     }
 }
 
 impl Contributor {
+
+    fn is_placeholder(&self) -> bool {
+        // Define the condition for a contributor to be considered a placeholder: check if the reward address is a default value
+        self.reward_address == Pubkey::default()
+    }
+
     // Method to handle consensus failure
     pub fn handle_consensus_failure(&mut self, current_time: u64) {
         self.consensus_failures += 1;
@@ -1147,7 +1433,7 @@ pub struct ProcessPayment<'info> {
 
 pub fn process_payment_helper(
     ctx: Context<ProcessPayment>, 
-    txid: String, 
+    txid: [u8; MAX_TXID_LENGTH], // 64 bytes for txid, 
     amount: u64
 ) -> Result<()> {
     // Access the pending payment account using the txid as a seed
@@ -1258,19 +1544,26 @@ pub mod solana_pastel_oracle_program {
             _ => return Err(OracleError::InvalidPaymentStatus.into()),
         };
     
+        // Convert txid string to byte array
+        let txid_bytes = PastelTxStatusReport::string_to_fixed_array(&txid);
+
         let pending_payment = PendingPayment {
-            txid: txid.clone(),
+            txid: txid_bytes,
             expected_amount,
             payment_status,
         };
-    
-        add_pending_payment_helper(ctx, txid, pending_payment)
+
+        add_pending_payment_helper(ctx, txid_bytes, pending_payment)
             .map_err(|e| e.into())
     }
     
     
     pub fn process_payment(ctx: Context<ProcessPayment>, txid: String, amount: u64) -> Result<()> {
-        process_payment_helper(ctx, txid, amount)
+        // Convert the txid String to a [u8; MAX_TXID_LENGTH] array using the existing utility function
+        let txid_array = PastelTxStatusReport::string_to_fixed_array(&txid);
+    
+        // Call the internal helper function with the converted txid
+        process_payment_helper(ctx, txid_array, amount)
     }
 
     pub fn submit_data_report(
@@ -1305,18 +1598,22 @@ pub mod solana_pastel_oracle_program {
         // Fetch current timestamp from Solana's clock
         let timestamp = Clock::get()?.unix_timestamp as u64;
 
+        // Convert txid and first_6_characters_hash from String to fixed-size byte arrays
+        let txid_bytes = PastelTxStatusReport::string_to_fixed_array(&txid);
+        let first_6_characters_hash_bytes = PastelTxStatusReport::string_to_fixed_array_6(&first_6_characters_hash);
+
         // Construct the report
         let report = PastelTxStatusReport {
-            txid: txid.clone(),
+            txid: txid_bytes,
             txid_status,
             pastel_ticket_type: Some(pastel_ticket_type),
-            first_6_characters_of_sha3_256_hash_of_corresponding_file: Some(first_6_characters_hash),
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: Some(first_6_characters_hash_bytes),
             timestamp,
             contributor_reward_address,
         };
 
         // Call the helper function to submit the report
-        submit_data_report_helper(ctx, txid, report, contributor_reward_address)    
+        submit_data_report_helper(ctx, txid_bytes, report, contributor_reward_address)    
     }
     
     pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
