@@ -802,7 +802,13 @@ pub fn update_activity_and_compliance_helper(
 
     // Ensuring compliance score is within bounds
     contributor.compliance_score = cmp::min(cmp::max(contributor.compliance_score, -100), 100);
-    contributor.reliability_score = (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32 * 100.0) as u32;
+
+    // Ensure total_reports_submitted is greater than zero before calculating reliability score
+    contributor.reliability_score = if contributor.total_reports_submitted > 0 {
+        ((contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32) * 100.0).min(100.0) as u32
+    } else {
+        0 // Default value when there are no reports submitted yet
+    };
 
     msg!("Final Compliance Score: {}, Reliability Score: {}", contributor.compliance_score, contributor.reliability_score);
 

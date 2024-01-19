@@ -21,7 +21,7 @@ const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_REPORTS_FOR_REWARD = 10;
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
-const maxSize = 800 * 1024; // 200KB
+const maxSize = 200 * 1024; // 200KB
 
 const TxidStatusEnum = {
   Invalid: "Invalid",
