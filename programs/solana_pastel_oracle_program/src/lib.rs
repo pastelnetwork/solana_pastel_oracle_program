@@ -22,7 +22,6 @@ const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to r
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
 
-
 #[error_code]
 pub enum OracleError {
     ContributorAlreadyRegistered,
@@ -241,10 +240,19 @@ fn calculate_consensus_and_cleanup(
         number_of_contributors_included: contributor_count as u32,
     });
     state.assess_and_apply_bans(current_timestamp);
-    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
 
-    // Cleanup: Remove processed entries from temp_tx_status_reports related to the txid
-    state.temp_tx_status_reports.retain(|report| report.txid != txid);
+    msg!("Size of temp_tx_status_reports before pruning: {}", state.temp_tx_status_reports.len());
+    msg!("Size of aggregated_consensus_data before pruning: {}", state.aggregated_consensus_data.len());
+
+    // Cleanup: Remove processed entries from temp_tx_status_reports related to the current txid
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    state.temp_tx_status_reports.retain(|report| 
+        report.txid != txid && current_timestamp - report.timestamp < DATA_RETENTION_PERIOD
+    );
+
+    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
+    msg!("Size of temp_tx_status_reports after pruning: {}", state.temp_tx_status_reports.len());
+    msg!("Size of aggregated_consensus_data after pruning: {}", state.aggregated_consensus_data.len());
 
     Ok(())
 }
