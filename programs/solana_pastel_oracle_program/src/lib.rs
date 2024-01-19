@@ -44,6 +44,7 @@ pub enum OracleError {
     InvalidTxidStatus,
     InvalidPastelTicketType,
     ContributorNotRegisteredOrBanned,
+    MemoryAllocationFailed,
 }
 
 impl From<OracleError> for ProgramError {
@@ -259,10 +260,9 @@ fn calculate_consensus_and_cleanup(
 
 
 fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxStatusReport, weight: u32, txid: &str) -> Result<()> {
-    let weight_i32 = weight as i32; // Direct conversion without try_into
-    let current_timestamp = Clock::get()?.unix_timestamp as u64; // Get the current timestamp only once
+    let weight_i32 = weight as i32;
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    // Find existing data or create new
     let data = state.aggregated_consensus_data.iter_mut().find(|d| d.txid == txid);
 
     if let Some(data_entry) = data {
@@ -273,6 +273,18 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
         }
         data_entry.last_updated = current_timestamp;
     } else {
+        // Dynamically determine additional capacity needed
+        let additional_capacity = 1; // Assuming each new data typically requires space for one element
+        let max_capacity = 32 * 1024 / std::mem::size_of::<AggregatedConsensusData>(); // Calculate the maximum possible number of elements
+
+        if state.aggregated_consensus_data.len() + additional_capacity > max_capacity {
+            // Handle the case where we are at or near maximum capacity
+            return Err(OracleError::MemoryAllocationFailed.into());
+        } else if state.aggregated_consensus_data.len() == state.aggregated_consensus_data.capacity() {
+            // Only reserve additional capacity if needed
+            state.aggregated_consensus_data.reserve(additional_capacity);
+        }
+
         // Create new data
         let mut new_data = AggregatedConsensusData {
             txid: txid.to_string(),
