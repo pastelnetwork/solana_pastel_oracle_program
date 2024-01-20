@@ -106,7 +106,9 @@ describe('Initialization', () => {
       await program.methods.reallocateOracleState()
         .accounts({
           oracleContractState: oracleContractState.publicKey,
-          adminPubkey: admin.publicKey
+          adminPubkey: admin.publicKey,
+          tempReportAccount: tempReportAccountPDA,
+          contributorDataAccount: contributorDataAccountPDA,
         })
         .rpc();
 

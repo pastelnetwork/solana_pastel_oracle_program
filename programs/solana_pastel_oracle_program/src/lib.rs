@@ -12,7 +12,7 @@ const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports i
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const PERMANENT_BAN_THRESHOLD: u32 = 100; // Number of non-consensus report submissions for permanent ban
 const CONTRIBUTIONS_FOR_PERMANENT_BAN: u32 = 250; // Considered for permanent ban after 250 contributions
-const TEMPORARY_BAN_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
+const TEMPORARY_BAN_THRESHOLD: u32 = 15; // Number of non-consensus report submissions for temporary ban
 const CONTRIBUTIONS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 contributions
 const TEMPORARY_BAN_DURATION: u64 = 604800; // Duration of temporary ban in seconds (e.g., 1 week)
 const MIN_NUMBER_OF_ORACLES: usize = 10; // Minimum number of oracles to calculate consensus
@@ -182,15 +182,6 @@ pub struct SubmitDataReport<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[event]
-pub struct DataReportSubmitted {
-    pub contributor: Pubkey,
-    pub txid: String,
-    pub status: String,
-    pub timestamp: u64,
-}
-
-
 fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
     // Get the current timestamp
     let current_timestamp_u64 = Clock::get()?.unix_timestamp as u64;
@@ -246,12 +237,7 @@ fn calculate_consensus(
     temp_report_account: &TempTxStatusReportAccount,
     contributor_data_account: &mut Account<ContributorDataAccount>,
     txid: &str,
-    program_id: &Pubkey,
 ) -> Result<()> {
-    // Ownership check
-    if contributor_data_account.to_account_info().owner != program_id {
-        return Err(OracleError::UnauthorizedAccess.into());
-    }    
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
     let (consensus_status, consensus_hash) = get_aggregated_data(state, txid)
         .map(|data| compute_consensus(data))
@@ -275,13 +261,7 @@ fn calculate_consensus(
         }
     }
 
-    // Emitting consensus event
-    emit!(ConsensusReachedEvent {
-        txid: txid.to_string(),
-        status: format!("{:?}", consensus_status),
-        hash: consensus_hash,
-        number_of_contributors_included: contributor_count as u32,
-    });
+    msg!("Consensus reached for TXID: {}, Status: {:?}, Hash: {}, Number of Contributors Included: {}", txid, consensus_status, consensus_hash, contributor_count);
 
     Ok(())
 }
@@ -456,10 +436,9 @@ pub fn submit_data_report_helper(
         let contributor_data_account: &mut Account<'_, ContributorDataAccount> = &mut ctx.accounts.contributor_data_account;
 
         msg!("Calculating consensus...");
-        calculate_consensus(state, temp_report_account, contributor_data_account, &txid, ctx.program_id)?;
+        calculate_consensus(state, temp_report_account, contributor_data_account, &txid)?;
 
         msg!("Performing post-consensus tasks...");
-
         post_consensus_tasks(state, temp_report_account, contributor_data_account, &txid)?;
     }
     
@@ -469,14 +448,6 @@ pub fn submit_data_report_helper(
 
     // Log the new size of temp_tx_status_reports
     msg!("New size of temp_tx_status_reports in bytes: {}", temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>());
-
-    // Emitting event for data report submission
-    emit!(DataReportSubmitted {
-        contributor: contributor_reward_address,
-        txid,
-        status: format!("{:?}", report.txid_status),
-        timestamp: report.timestamp,
-    });
 
     Ok(())
 }
@@ -823,12 +794,6 @@ pub struct RequestReward<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[event]
-pub struct RewardEvent {
-    pub contributor: Pubkey,
-    pub amount: u64,
-    pub status: String,
-}
 
 pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
 
@@ -851,27 +816,14 @@ pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: P
         return Err(OracleError::UnregisteredOracle.into());
     }
 
-    // Handle reward transfer and event emission after determining eligibility
+    // Handle reward transfer after determining eligibility
     if is_reward_valid {
         // Transfer the reward from the reward pool to the contributor
         **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
         **ctx.accounts.oracle_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
 
-        // Emit event for valid reward request
-        emit!(RewardEvent {
-            contributor: contributor_address,
-            amount: reward_amount,
-            status: "Valid Reward Paid".to_string(),
-        });
-
         msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
     } else {
-        // Emit event for invalid reward request
-        emit!(RewardEvent {
-            contributor: contributor_address,
-            amount: 0,
-            status: "Invalid Reward Request".to_string(),
-        });
 
         msg!("Invalid Reward Request: Contributor: {}", contributor_address);
         return Err(OracleError::NotEligibleForReward.into());
@@ -899,18 +851,8 @@ pub struct RegisterNewDataContributor<'info> {
 
 }
 
-#[event]
-pub struct ContributorRegisteredEvent {
-    pub address: Pubkey,
-    pub timestamp: u64,
-}
 
 pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContributor>) -> Result<()> {
-    // Ownership check for ContributorDataAccount
-    if ctx.accounts.contributor_data_account.to_account_info().owner != ctx.program_id {
-        return Err(OracleError::UnauthorizedAccess.into());
-    }
-
     let contributor_data_account = &mut ctx.accounts.contributor_data_account;
     msg!("Initiating new contributor registration: {}", ctx.accounts.contributor_account.key());
 
@@ -960,32 +902,9 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     // Append the new contributor to the ContributorDataAccount
     contributor_data_account.contributors.push(new_contributor);
 
-    // Emit event for new contributor registration
-    emit!(ContributorRegisteredEvent {
-        address: *ctx.accounts.contributor_account.key,
-        timestamp: last_active_timestamp,
-    });
-
     // Logging for debug purposes
     msg!("New Contributor successfully Registered: Address: {}, Timestamp: {}", ctx.accounts.contributor_account.key, last_active_timestamp);
     Ok(())
-}
-
-
-#[event]
-pub struct ContributorUpdatedEvent {
-    pub reward_address: Pubkey,
-    pub last_active_timestamp: u64,
-    pub total_reports_submitted: u32,
-    pub accurate_reports_count: u32,
-    pub current_streak: u32,
-    pub compliance_score: i32,
-    pub reliability_score: u32,
-    pub consensus_failures: u32,
-    pub ban_expiry: u64,
-    pub is_recently_active: bool,
-    pub is_reliable: bool,
-    pub is_eligible_for_rewards: bool,
 }
 
 
@@ -1002,7 +921,7 @@ fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accur
     let base_score_increment = 10;
     let score_increment = (base_score_increment as f32 * progressive_scaling * time_weight) as i32;
     let score_decrement = 5; // Fixed negative value for inaccuracies
-    let streak_bonus = if is_accurate { cmp::min(contributor.current_streak / 10, 5) as i32 } else { 0 };
+    let streak_bonus = if is_accurate { cmp::min(contributor.current_streak / 3, 5) as i32 } else { 0 };
 
     msg!("Updating Scores: Address: {}, Time Diff: {}, Days Inactive: {}, Progressive Scaling: {}, Time Weight: {}, Base Score Increment: {}, Score Increment: {}, Score Decrement: {}, Streak Bonus: {}",
         contributor.reward_address, time_diff, days_inactive, progressive_scaling, time_weight, base_score_increment, score_increment, score_decrement, streak_bonus);
@@ -1087,22 +1006,6 @@ pub fn update_activity_and_compliance_helper(
     // Updating contributor statuses
     update_statuses(contributor, current_timestamp);
 
-    // Emitting event for contributor update
-    emit!(ContributorUpdatedEvent {
-        reward_address: contributor.reward_address,
-        last_active_timestamp: contributor.last_active_timestamp,
-        total_reports_submitted: contributor.total_reports_submitted,
-        accurate_reports_count: contributor.accurate_reports_count,
-        current_streak: contributor.current_streak,
-        compliance_score: contributor.compliance_score,
-        reliability_score: contributor.reliability_score,
-        consensus_failures: contributor.consensus_failures,
-        ban_expiry: contributor.ban_expiry,
-        is_recently_active: contributor.is_recently_active,
-        is_reliable: contributor.is_reliable,
-        is_eligible_for_rewards: contributor.is_eligible_for_rewards,
-    });
-
     msg!("Contributor Update Complete: {}", contributor.reward_address);
 
     Ok(())
@@ -1150,11 +1053,6 @@ pub struct AddTxidForMonitoring<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[event]
-pub struct TxidAddedForMonitoringEvent {
-    pub txid: String,
-    pub expected_amount: u64,
-}
 
 pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
     let state = &mut ctx.accounts.oracle_contract_state;
@@ -1180,12 +1078,6 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
         expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
         payment_status: PaymentStatus::Pending, // Enum, no need for casting
     };
-
-    // Emit an event for adding TXID for monitoring
-    emit!(TxidAddedForMonitoringEvent {
-        txid: txid.clone(),
-        expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
-    });
 
     msg!("Added Pastel TXID for Monitoring: {}", pending_payment_account.pending_payment.txid);
     Ok(())
@@ -1256,14 +1148,6 @@ pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
         3 => Some(TxidStatus::MinedActivated),
         _ => None,
     }
-}
-
-#[event]
-pub struct ConsensusReachedEvent {
-    pub txid: String,
-    pub status: String,
-    pub hash: String,
-    pub number_of_contributors_included: u32,
 }
 
 
