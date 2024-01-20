@@ -19,6 +19,7 @@ let contributors = []; // Array to store contributor keypairs
 const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_REPORTS_FOR_REWARD = 10;
+const BAD_CONTRIBUTOR_INDEX = 8; // Define a constant to represent the index at which contributors are considered banned
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
 const maxSize = 200 * 1024; // 200KB
@@ -301,7 +302,7 @@ describe('Data Report Submission', () => {
         const rewardAddress = contributor.publicKey;
 
         // Randomize the status value for each report
-        const txidStatusValue = i < 8 ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
+        const txidStatusValue = i < BAD_CONTRIBUTOR_INDEX ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
         const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
         console.log(`Status value for TXID ${txid} by contributor ${contributor.publicKey.toBase58()} is '${txidStatusValue}'; ticket type value is '${pastelTicketTypeValue}'`);
 
@@ -346,8 +347,20 @@ describe('Data Report Submission', () => {
           .instruction();
 
           transaction.add(submitDataReportInstruction);
-          await provider.sendAndConfirm(transaction, [contributor]);
-          console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
+
+          // Attempt to submit the data report
+          try {
+            await provider.sendAndConfirm(transaction, [contributor]);
+            console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
+        } catch (error) {
+            if (i >= BAD_CONTRIBUTOR_INDEX ) { // Assuming contributors with index >= BAD_CONTRIBUTOR_INDEX  are expected to be banned
+                console.log(`Expected error for banned contributor ${contributor.publicKey.toBase58()}: contributor is banned and cannot submit reports. Error:  ${error}`);                
+            } else {
+                console.error(`Unexpected error: ${error}`);
+                throw error;
+            }
+        }          
+
         } catch (error) {
           console.error(`Error submitting report for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, error);
           throw error;

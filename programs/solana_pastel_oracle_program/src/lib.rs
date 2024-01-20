@@ -43,7 +43,8 @@ pub enum OracleError {
     InvalidPaymentStatus,
     InvalidTxidStatus,
     InvalidPastelTicketType,
-    ContributorNotRegisteredOrBanned,
+    ContributorNotRegistered,
+    ContributorBanned,
     MemoryAllocationFailed,
     UnauthorizedAccess
 }
@@ -363,6 +364,7 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
     Ok(())
 }
 
+
 fn find_or_add_common_report_data(
     temp_report_account: &mut TempTxStatusReportAccount, 
     common_data: &CommonReportData
@@ -382,20 +384,24 @@ pub fn submit_data_report_helper(
     report: PastelTxStatusReport,
     contributor_reward_address: Pubkey
 ) -> ProgramResult {
+    // Validate the data report before any contributor-specific checks
+    msg!("Validating data report: {:?}", report);
+    validate_data_contributor_report(&report)?;
 
-    let (compliance_score, is_banned) = {
-        let contributor = ctx.accounts.contributor_data_account.contributors
-            .iter()
-            .find(|c| c.reward_address == contributor_reward_address)
-            .ok_or(OracleError::ContributorNotRegisteredOrBanned)?;
+    // Check if the contributor is registered and not banned
+    let contributor = ctx.accounts.contributor_data_account.contributors
+        .iter()
+        .find(|c| c.reward_address == contributor_reward_address)
+        .ok_or(OracleError::ContributorNotRegistered)?;
 
-        (contributor.compliance_score, contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64))
-    };
-
-    // Exit early if the contributor is banned
+    let is_banned = contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64);
     if is_banned {
-        return Err(OracleError::ContributorNotRegisteredOrBanned.into());
-    }
+        return Err(OracleError::ContributorBanned.into());
+    }    
+
+    // Fetch compliance score for further processing
+    let compliance_score = contributor.compliance_score;
+
 
     // Dereference to get the OracleContractState
     let state: &mut Account<'_, OracleContractState> = &mut ctx.accounts.oracle_contract_state;
@@ -1017,6 +1023,12 @@ pub fn update_activity_and_compliance_helper(
     current_timestamp: u64, 
     is_accurate: bool,
 ) -> Result<()> {
+    // Check if the contributor is banned before proceeding
+    if contributor.calculate_is_banned(current_timestamp) {
+        msg!("Contributor is currently banned and cannot be updated: {}", contributor.reward_address);
+        return Err(OracleError::ContributorBanned.into()); // Using a distinct error for clarity
+    }
+
     // Updating scores
     update_scores(contributor, current_timestamp, is_accurate);
 
