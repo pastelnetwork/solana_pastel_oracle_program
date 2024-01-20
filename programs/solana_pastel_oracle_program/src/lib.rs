@@ -7,14 +7,14 @@ use std::cmp;
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
 const MIN_REPORTS_FOR_REWARD: u32 = 10; // Data Contributor must submit at least 10 reports to be eligible for rewards
-const MIN_COMPLIANCE_SCORE_FOR_REWARD: i32 = 80; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
+const MIN_COMPLIANCE_SCORE_FOR_REWARD: i32 = 75; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
 const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount, which is scaled based on the number of highly reliable contributors
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const PERMANENT_BAN_THRESHOLD: u32 = 100; // Number of non-consensus report submissions for permanent ban
 const CONTRIBUTIONS_FOR_PERMANENT_BAN: u32 = 250; // Considered for permanent ban after 250 contributions
-const TEMPORARY_BAN_THRESHOLD: u32 = 15; // Number of non-consensus report submissions for temporary ban
+const TEMPORARY_BAN_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
 const CONTRIBUTIONS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 contributions
-const TEMPORARY_BAN_DURATION: u64 = 604800; // Duration of temporary ban in seconds (e.g., 1 week)
+const TEMPORARY_BAN_DURATION: u64 =  24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
 const MIN_NUMBER_OF_ORACLES: usize = 10; // Minimum number of oracles to calculate consensus
 const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS: u64 = 20 * 60; // Maximum duration in seconds from last report submission for a given TXID before computing consensus (e.g., 20 minutes)
 const DATA_RETENTION_PERIOD: u64 = 3 * 24 * 60 * 60; // How long to keep data in the contract state (3 days)
@@ -266,17 +266,37 @@ fn calculate_consensus(
     Ok(())
 }
 
-pub fn assess_and_apply_bans(contributor_data_account: &mut Account<ContributorDataAccount>, current_time: u64) {
-    for contributor in &mut contributor_data_account.contributors {
-        contributor.handle_consensus_failure(current_time);
+
+pub fn handle_consensus_failure(contributor_data_account: &mut Account<ContributorDataAccount>, contributor_address: Pubkey, current_time: u64) {
+    if let Some(contributor) = contributor_data_account.contributors.iter_mut().find(|c| c.reward_address == contributor_address) {
+        contributor.consensus_failures += 1;
+        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
+            // Apply temporary ban
+            contributor.ban_expiry = current_time + TEMPORARY_BAN_DURATION;
+        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
+            // Apply permanent ban
+            contributor.ban_expiry = u64::MAX;
+        }
+        msg!("Contributor Ban Update: Address: {}, Ban Expiry: {}", contributor.reward_address, contributor.ban_expiry);
     }
+}
+
+
+pub fn assess_and_apply_bans(contributor_data_account: &mut Account<ContributorDataAccount>, current_time: u64) {
+    let contributor_addresses: Vec<Pubkey> = contributor_data_account.contributors.iter().map(|c| c.reward_address).collect();
+
+    for contributor_address in contributor_addresses {
+        handle_consensus_failure(contributor_data_account, contributor_address, current_time);
+    }
+
     contributor_data_account.contributors.retain(|c| !c.calculate_is_banned(current_time));
 }
+
 
 fn post_consensus_tasks(
     state: &mut OracleContractState, 
     temp_report_account: &mut TempTxStatusReportAccount,
-    contributor_data_account: &mut Account<ContributorDataAccount>, // Add this parameter
+    contributor_data_account: &mut Account<ContributorDataAccount>,
     txid: &str,
 ) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
@@ -1181,18 +1201,6 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
 
 
 impl Contributor {
-    // Method to handle consensus failure
-    pub fn handle_consensus_failure(&mut self, current_time: u64) {
-        self.consensus_failures += 1;
-        if self.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && self.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
-            // Apply temporary ban
-            self.ban_expiry = current_time + TEMPORARY_BAN_DURATION;
-        } else if self.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && self.consensus_failures >= PERMANENT_BAN_THRESHOLD {
-            // Apply permanent ban
-            self.ban_expiry = u64::MAX;
-        }
-        msg!("Contributor Ban Update: Address: {}, Ban Expiry: {}", self.reward_address, self.ban_expiry);
-    }
 
     // Method to check if the contributor is recently active
     fn calculate_is_recently_active(&self, last_txid_request_time: u64) -> bool {
@@ -1206,6 +1214,7 @@ impl Contributor {
         last_active_timestamp_i64 >= last_txid_request_time as i64 &&
             Clock::get().unwrap().unix_timestamp - last_active_timestamp_i64 < recent_activity_threshold as i64
     }
+
     // Method to check if the contributor is reliable
     fn calculate_is_reliable(&self) -> bool {
         // Define what makes a contributor reliable; for example, a high reliability score which is a ratio of accurate reports to total reports
@@ -1215,10 +1224,12 @@ impl Contributor {
         let reliability_ratio = self.accurate_reports_count as f32 / self.total_reports_submitted as f32;
         reliability_ratio >= 0.8 // Example threshold for reliability, e.g., 80% accuracy
     }    
+
     // Check if the contributor is currently banned
     pub fn calculate_is_banned(&self, current_time: u64) -> bool {
         current_time < self.ban_expiry
     }
+
     // Method to determine if the contributor is eligible for rewards
     pub fn calculate_is_eligible_for_rewards(&self) -> bool {
         self.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
