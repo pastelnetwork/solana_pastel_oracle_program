@@ -52,6 +52,18 @@ describe('Initialization', () => {
       program.programId
     );
 
+    // Find the PDA for the ContributorDataAccount
+    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );    
+
+    // Find the PDA for the TempTxStatusReportAccount
+    const [tempReportAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_tx_status_report")],
+      program.programId
+    );    
+
     // Calculate the rent-exempt minimum balance for the account size
     const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
     console.log("Minimum Balance for Rent Exemption:", minBalanceForRentExemption);
@@ -72,9 +84,11 @@ describe('Initialization', () => {
     await program.methods.initialize(admin.publicKey)
       .accounts({
         oracleContractState: oracleContractState.publicKey,
+        contributorDataAccount: contributorDataAccountPDA,
         user: admin.publicKey,
         rewardPoolAccount: rewardPoolAccountPDA,
         feeReceivingContractAccount: feeReceivingContractAccountPDA,
+        tempReportAccount: tempReportAccountPDA,
         systemProgram: web3.SystemProgram.programId,
       })
       .signers([oracleContractState])
@@ -142,6 +156,11 @@ describe('Contributor Registration', () => {
       program.programId
     );
 
+    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
+    
     for (let i = 0; i < NUM_CONTRIBUTORS; i++) {
       // Generate a new keypair for each contributor
       const contributor = web3.Keypair.generate();
@@ -161,7 +180,7 @@ describe('Contributor Registration', () => {
       // Call the RPC method to register the new data contributor
       await program.methods.registerNewDataContributor()
         .accounts({
-          oracleContractState: oracleContractState.publicKey,
+          contributorDataAccount: contributorDataAccountPDA,
           contributorAccount: contributor.publicKey,
           rewardPoolAccount: rewardPoolAccountPDA,
           feeReceivingContractAccount: feeReceivingContractAccountPDA,
@@ -173,14 +192,14 @@ describe('Contributor Registration', () => {
       contributors.push(contributor);
     }
 
-    // Fetch the updated state to verify all contributors are registered
-    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-    console.log('Total number of registered contributors:', state.contributors.length);
+    // Fetch the ContributorDataAccount to verify all contributors are registered
+    const contributorData = await program.account.contributorDataAccount.fetch(contributorDataAccountPDA);
+    console.log('Total number of registered contributors in ContributorDataAccount:', contributorData.contributors.length);
 
-    // Verify each contributor is registered
+    // Verify each contributor is registered in ContributorDataAccount
     contributors.forEach((contributor, index) => {
-      const isRegistered = state.contributors.some(c => c.rewardAddress.equals(contributor.publicKey));
-      assert.isTrue(isRegistered, `Contributor ${index + 1} should be registered`);
+      const isRegistered = contributorData.contributors.some(c => c.rewardAddress.equals(contributor.publicKey));
+      assert.isTrue(isRegistered, `Contributor ${index + 1} should be registered in ContributorDataAccount`);
     });
   });
 });
@@ -259,6 +278,12 @@ describe('Data Report Submission', () => {
       console.log(`Transferred ${transferAmountSOL} SOL to contributor account with address ${contributor.publicKey.toBase58()}`);
     }
 
+    // Find the PDA for the ContributorDataAccount
+    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );    
+
     // Fetch monitored TXIDs from the updated state
     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
     const monitoredTxids = state.monitoredTxids;
@@ -289,6 +314,11 @@ describe('Data Report Submission', () => {
         const [reportAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
         // console.log(`Report account PDA for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`, reportAccountPDA.toBase58());
 
+        // Derive the PDA for TempTxStatusReportAccount
+        const [tempReportAccountPDA] = web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_tx_status_report")],
+          program.programId
+        );    
 
         // Create and send the transaction
         try {
@@ -304,6 +334,8 @@ describe('Data Report Submission', () => {
           )
           .accounts({
             reportAccount: reportAccountPDA,
+            tempReportAccount: tempReportAccountPDA,   
+            contributorDataAccount: contributorDataAccountPDA,         
             oracleContractState: oracleContractState.publicKey,
             user: contributor.publicKey,
             systemProgram: web3.SystemProgram.programId,
