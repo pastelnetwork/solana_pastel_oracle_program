@@ -13,16 +13,17 @@ const programID = new anchor.web3.PublicKey("AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNb
 const program = new Program<SolanaPastelOracleProgram>(IDL, programID, provider);
 const admin = provider.wallet; // Use the provider's wallet
 const oracleContractState = web3.Keypair.generate();
+let contributors = []; // Array to store contributor keypairs
+const maxSize = 100 * 1024; // 200KB (max size of the oracle contract state account)
+
 const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
 const NUM_CONTRIBUTORS = 10;
-let contributors = []; // Array to store contributor keypairs
-const txidToAdd = '9930511c526808e6849a25cb0eb6513f729c2a71ec51fbca084d7c7e4a8dea2f';
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_REPORTS_FOR_REWARD = 10;
 const BAD_CONTRIBUTOR_INDEX = 8; // Define a constant to represent the index at which contributors are considered banned
-const MIN_COMPLIANCE_SCORE_FOR_REWARD = 80;
+const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
+const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
-const maxSize = 200 * 1024; // 200KB
 
 const TxidStatusEnum = {
   Invalid: "Invalid",
@@ -262,6 +263,36 @@ describe('TXID Monitoring', () => {
 
 
 
+describe('TXID Monitoring Verification', () => {
+  it('Verifies all monitored TXIDs have corresponding PendingPayment structs', async () => {
+    // Fetch monitored TXIDs from the updated state
+    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    const monitoredTxids = state.monitoredTxids;
+
+    for (const txid of monitoredTxids) {
+      // Derive the PDA for each PendingPaymentAccount
+      const preimageString = "pending_payment" + txid + admin.publicKey.toBase58();
+      const preimageBytes = Buffer.from(preimageString, 'utf8');
+      const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+      const [pendingPaymentAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
+
+      // Fetch the PendingPayment struct for each TXID
+      const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(pendingPaymentAccountPDA);
+
+      // Assertions to verify the PendingPayment struct is correctly initialized
+      assert.strictEqual(pendingPaymentData.pendingPayment.txid, txid, `The TXID in PendingPayment should match the monitored TXID: ${txid}`);
+      assert.strictEqual(pendingPaymentData.pendingPayment.expectedAmount.toNumber(), COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL, `The expected amount in PendingPayment should match for TXID: ${txid}`);
+
+      // Convert paymentStatus to JSON and compare the stringified version
+      const paymentStatusJson = JSON.stringify(pendingPaymentData.pendingPayment.paymentStatus);
+      assert.strictEqual(paymentStatusJson, JSON.stringify({pending: {}}), `The payment status for TXID: ${txid} should be 'Pending'`);
+      console.log(`Verified PendingPayment struct for monitored TXID: ${txid}`);
+    }
+  });
+});
+
+
+
 describe('Data Report Submission', () => {
   it('Submits multiple data reports for different TXIDs with consensus and dissent', async () => {
     const seedPreamble = "pastel_tx_status_report";
@@ -384,7 +415,7 @@ describe('Data Report Submission', () => {
     for (const txid of monitoredTxids) {
       // Fetch the updated state after all submissions for this TXID
       const updatedState = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
-      console.log(`Updated Oracle Contract State for TXID ${txid}:`, updatedState);
+      // console.log(`Updated Oracle Contract State for TXID ${txid}:`, updatedState);
 
       // Check if the txid is in the monitored list
       assert(updatedState.monitoredTxids.includes(txid), `TXID ${txid} should be in the monitored list`);
@@ -408,28 +439,142 @@ describe('Data Report Submission', () => {
       // Add further checks if needed based on the contract's consensus logic
       console.log(`Data report submission verification successful for the TXID: ${txid}`);
     }
+
+    console.log(`Data report submission verification successful for all monitored TXIDs`);
+    console.log(`______________________________________________________`);
+    console.log(`Now checking the state of each contributor:`);
+    //Loop through contributors to show their state:
+    const contributorData = await program.account.contributorDataAccount.fetch(contributorDataAccountPDA);
+
+    for (const contributor of contributors) {
+      const currentContributorData = contributorData.contributors.find(c => c.rewardAddress.equals(contributor.publicKey));
+
+    // Check if the contributor data exists
+    if (!currentContributorData) {
+      throw new Error(`Contributor data not found for address ${contributor.publicKey.toBase58()}`);
+    }
+
+    // Log all fields for each contributor
+    console.log(`Contributor: ${contributor.publicKey.toBase58()}`);
+    console.log(`Registration Entrance Fee Transaction Signature: ${currentContributorData.registrationEntranceFeeTransactionSignature}`);
+    console.log(`Compliance Score: ${currentContributorData.complianceScore}`);
+    console.log(`Last Active Timestamp: ${currentContributorData.lastActiveTimestamp}`);
+    console.log(`Total Reports Submitted: ${currentContributorData.totalReportsSubmitted}`);
+    console.log(`Accurate Reports Count: ${currentContributorData.accurateReportsCount}`);
+    console.log(`Current Streak: ${currentContributorData.currentStreak}`);
+    console.log(`Reliability Score: ${currentContributorData.reliabilityScore}`);
+    console.log(`Consensus Failures: ${currentContributorData.consensusFailures}`);
+    console.log(`Ban Expiry: ${currentContributorData.banExpiry}`);
+    console.log(`Is Eligible for Rewards: ${currentContributorData.isEligibleForRewards}`);
+    console.log(`Is Recently Active: ${currentContributorData.isRecentlyActive}`);
+    console.log(`Is Reliable: ${currentContributorData.isReliable}`);
+    console.log(`______________________________________________________`);
+  }
+
+  });
+
+
+});
+
+
+describe('Payment Processing by Bridge Contract', () => {
+  it('Processes payments for monitored TXIDs', async () => {
+    const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING = new BN(COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL);
+    // Derive the FeeReceivingContractAccount PDA
+    const [feeReceivingContractAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_receiving_contract")],
+      program.programId
+    );
+
+    // Fetch monitored TXIDs from the updated state
+    const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+    const monitoredTxids = state.monitoredTxids;
+
+    for (const txid of monitoredTxids) {
+      // Transfer the payment for the TXID from the admin account to the fee-receiving contract
+      const transferTransaction = new anchor.web3.Transaction().add(
+        anchor.web3.SystemProgram.transfer({
+          fromPubkey: admin.publicKey,
+          toPubkey: feeReceivingContractAccountPDA,
+          lamports: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING.toNumber(),
+        })
+      );
+
+      await provider.sendAndConfirm(transferTransaction);
+      console.log(`Transferred payment for TXID ${txid} to fee-receiving contract`);
+
+      // Manually create the seed for pendingPaymentAccountPDA
+      const preimageString = "pending_payment" + txid + admin.publicKey.toBase58();
+      const preimageBytes = Buffer.from(preimageString, 'utf8');
+      const seedHash = crypto.createHash('sha256').update(preimageBytes).digest();
+      const [pendingPaymentAccountPDA] = web3.PublicKey.findProgramAddressSync([seedHash], program.programId);
+
+      // Process the payment in the oracle contract
+      await program.methods.processPayment(txid, COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING)
+        .accounts({
+          sourceAccount: admin.publicKey,
+          oracleContractState: oracleContractState.publicKey,
+          pendingPaymentAccount: pendingPaymentAccountPDA,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .rpc();
+
+      // Fetch the updated PendingPayment struct to verify the payment status
+      const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(pendingPaymentAccountPDA);
+
+      // Convert paymentStatus to JSON and compare the stringified version
+      const paymentStatusJson = JSON.stringify(pendingPaymentData.pendingPayment.paymentStatus);
+      assert.strictEqual(paymentStatusJson, JSON.stringify({received: {}}), `The payment status for TXID: ${txid} should be 'Received'`);
+
+      console.log(`Payment processed for TXID ${txid}`);
+    }
   });
 });
 
 
-// describe('Eligibility for Rewards', () => {
-//   it('should check if contributors meet reward eligibility criteria', async () => {
-//     // Fetch the updated state after all submissions
-//     const state = await program.account.oracleContractState.fetch(oracleContractState.publicKey);
+describe('Eligibility for Rewards', () => {
+  it('should check if contributors meet reward eligibility criteria', async () => {
+    // Fetch the ContributorDataAccount
+    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );    
+    const contributorData = await program.account.contributorDataAccount.fetch(contributorDataAccountPDA);
 
-//     // Loop through each contributor and check their eligibility
-//     for (const contributor of contributors) {
-//       const contributorData = state.contributors.find(c => c.rewardAddress.equals(contributor.publicKey));
+    // Loop through each contributor and check their eligibility
+    for (const contributor of contributors) {
+      const currentContributorData = contributorData.contributors.find(c => c.rewardAddress.equals(contributor.publicKey));
 
-//       // Define your eligibility criteria based on your contract logic
-//       const isEligibleForRewards = contributorData.totalReportsSubmitted >= MIN_REPORTS_FOR_REWARD 
-//                                     && contributorData.reliabilityScore >= 80 
-//                                     && contributorData.complianceScore >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
+      // Check if the contributor data exists
+      if (!currentContributorData) {
+        throw new Error(`Contributor data not found for address ${contributor.publicKey.toBase58()}`);
+      }
 
-//       assert(isEligibleForRewards, `Contributor with address ${contributor.publicKey.toBase58()} should be eligible for rewards`);
-//     }
-//   });
-// });
+      // Log all fields for each contributor
+      console.log(`Contributor: ${contributor.publicKey.toBase58()}`);
+      console.log(`Registration Entrance Fee Transaction Signature: ${currentContributorData.registrationEntranceFeeTransactionSignature}`);
+      console.log(`Compliance Score: ${currentContributorData.complianceScore}`);
+      console.log(`Last Active Timestamp: ${currentContributorData.lastActiveTimestamp}`);
+      console.log(`Total Reports Submitted: ${currentContributorData.totalReportsSubmitted}`);
+      console.log(`Accurate Reports Count: ${currentContributorData.accurateReportsCount}`);
+      console.log(`Current Streak: ${currentContributorData.currentStreak}`);
+      console.log(`Reliability Score: ${currentContributorData.reliabilityScore}`);
+      console.log(`Consensus Failures: ${currentContributorData.consensusFailures}`);
+      console.log(`Ban Expiry: ${currentContributorData.banExpiry}`);
+      console.log(`Is Eligible for Rewards: ${currentContributorData.isEligibleForRewards}`);
+      console.log(`Is Recently Active: ${currentContributorData.isRecentlyActive}`);
+      console.log(`Is Reliable: ${currentContributorData.isReliable}`);
+      console.log(`______________________________________________________`);
+
+      // Define your eligibility criteria based on your contract logic
+      const isEligibleForRewards = currentContributorData.totalReportsSubmitted >= MIN_REPORTS_FOR_REWARD 
+                                    && currentContributorData.reliabilityScore >= MIN_RELIABILITY_SCORE_FOR_REWARD 
+                                    && currentContributorData.complianceScore >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
+
+      assert(isEligibleForRewards, `Contributor with address ${contributor.publicKey.toBase58()} should be eligible for rewards`);
+    }
+  });
+});
 
 
 // describe('Reward Distribution', () => {

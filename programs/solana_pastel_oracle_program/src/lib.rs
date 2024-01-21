@@ -3,11 +3,12 @@ use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
-use std::cmp;
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
+const MIN_NUMBER_OF_ORACLES: usize = 10; // Minimum number of oracles to calculate consensus
 const MIN_REPORTS_FOR_REWARD: u32 = 10; // Data Contributor must submit at least 10 reports to be eligible for rewards
-const MIN_COMPLIANCE_SCORE_FOR_REWARD: i32 = 75; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
+const MIN_COMPLIANCE_SCORE_FOR_REWARD: f32 = 65.0; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
+const MIN_RELIABILITY_SCORE_FOR_REWARD: f32 = 80.0; // Minimum reliability score to be eligible for rewards
 const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount, which is scaled based on the number of highly reliable contributors
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const PERMANENT_BAN_THRESHOLD: u32 = 100; // Number of non-consensus report submissions for permanent ban
@@ -15,12 +16,12 @@ const CONTRIBUTIONS_FOR_PERMANENT_BAN: u32 = 250; // Considered for permanent ba
 const TEMPORARY_BAN_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
 const CONTRIBUTIONS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 contributions
 const TEMPORARY_BAN_DURATION: u64 =  24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
-const MIN_NUMBER_OF_ORACLES: usize = 10; // Minimum number of oracles to calculate consensus
 const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS: u64 = 20 * 60; // Maximum duration in seconds from last report submission for a given TXID before computing consensus (e.g., 20 minutes)
 const DATA_RETENTION_PERIOD: u64 = 3 * 24 * 60 * 60; // How long to keep data in the contract state (3 days)
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 86_400; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
+
 
 #[error_code]
 pub enum OracleError {
@@ -233,6 +234,131 @@ fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, 
     (consensus_status, consensus_hash)
 }
 
+
+fn apply_bans(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
+    if !is_accurate {
+
+        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
+            contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
+            msg!("Contributor: {} is temporarily banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Ban expires on: {}", 
+            contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, TEMPORARY_BAN_THRESHOLD, contributor.ban_expiry);
+        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
+            contributor.ban_expiry = u64::MAX;
+            msg!("Contributor: {} is permanently banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Removing from list of contributors!", 
+            contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, PERMANENT_BAN_THRESHOLD);
+        }
+    }
+}
+
+fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
+    let time_diff = current_timestamp.saturating_sub(contributor.last_active_timestamp);
+    let hours_inactive: f32 = time_diff as f32 / 3_600.0; // 3,600 seconds in an hour
+
+    // Progressive scaling adjustment
+    let progressive_scaling = if contributor.total_reports_submitted > 0 {
+        1.0 / (1.0 + (contributor.total_reports_submitted as f32 * 0.02).log2())
+    } else {
+        1.0
+    };
+
+    let time_weight = 1.0 / (1.0 + hours_inactive / 480.0);
+
+    let base_score_increment = 3.0;
+    let score_increment = base_score_increment * progressive_scaling * time_weight;
+    let score_decrement = 20.0; // Significantly increased decrement for inaccuracies
+
+    // More aggressive score decay
+    let decay_rate: f32 = 0.95;
+    let decay_factor = decay_rate.powf(hours_inactive / 24.0); // Decay applied daily
+
+    let streak_bonus = if is_accurate {
+        // Consider removing or reducing streak bonus
+        (contributor.current_streak as f32 / 20.0).min(1.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    if is_accurate {
+        contributor.total_reports_submitted += 1;
+        contributor.accurate_reports_count += 1;
+        contributor.current_streak += 1;
+        contributor.compliance_score += score_increment + streak_bonus;
+    } else {
+        contributor.total_reports_submitted += 1;
+        contributor.current_streak = 0;
+        contributor.consensus_failures += 1;
+        contributor.compliance_score -= score_decrement;
+    }
+
+    contributor.compliance_score *= decay_factor;
+
+    msg!("Scores Before Logistic Scaling: Address: {}, Compliance Score: {}, Reliability Score: {}",
+        contributor.reward_address, contributor.compliance_score, contributor.reliability_score);
+
+    // Adjust logistic scaling
+    contributor.compliance_score = logistic_scale(contributor.compliance_score, 100.0, 0.1, -200.0);
+
+    // Reliability score normalization
+    contributor.reliability_score = if contributor.total_reports_submitted > 0 {
+        (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32) * 100.0
+    } else {
+        0.0
+    }.clamp(0.0, 100.0);
+
+    log_score_updates(contributor);
+}
+
+fn logistic_scale(score: f32, max_value: f32, steepness: f32, midpoint: f32) -> f32 {
+    max_value / (1.0 + (-steepness * (score - midpoint)).exp())
+}
+
+fn log_score_updates(contributor: &Contributor) {
+    msg!("Scores After Update: Address: {}, Compliance Score: {}, Reliability Score: {}",
+        contributor.reward_address, contributor.compliance_score, contributor.reliability_score);
+}
+
+fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
+    // Updating recently active status
+    let recent_activity_threshold = 86_400; // 24 hours in seconds
+    contributor.is_recently_active = current_timestamp - contributor.last_active_timestamp < recent_activity_threshold;
+    msg!("Updated 'is_recently_active' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_recently_active);
+
+    // Updating reliability status
+    contributor.is_reliable = if contributor.total_reports_submitted > 0 {
+        let reliability_ratio = contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32;
+        reliability_ratio >= 0.8 // Example threshold for reliability
+    } else {
+        false
+    };
+    msg!("Updated 'is_reliable' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_reliable);
+
+    // Updating eligibility for rewards
+    contributor.is_eligible_for_rewards = contributor.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
+        && contributor.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD 
+        && contributor.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
+    msg!("Updated 'is_eligible_for_rewards' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_eligible_for_rewards);
+}
+
+fn update_contributor(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
+    // Check if the contributor is banned before proceeding. If so, just return.
+    if contributor.calculate_is_banned(current_timestamp) {
+        msg!("Contributor is currently banned and cannot be updated: {}", contributor.reward_address);
+        return; // We don't stop the process here, just skip this contributor.
+    }
+
+    // Updating scores
+    update_scores(contributor, current_timestamp, is_accurate);
+
+    // Applying bans based on report accuracy
+    apply_bans(contributor, current_timestamp, is_accurate);
+
+    // Updating contributor statuses
+    update_statuses(contributor, current_timestamp);
+
+    msg!("Contributor Update Complete: {}", contributor.reward_address);
+}
+
+
 fn calculate_consensus(
     state: &mut OracleContractState, 
     temp_report_account: &TempTxStatusReportAccount,
@@ -255,43 +381,33 @@ fn calculate_consensus(
             if let Some(contributor) = contributor_data_account.contributors.iter_mut().find(|c| c.reward_address == specific_data.contributor_reward_address) {
                 let is_accurate = common_data.txid_status == consensus_status &&
                     common_data.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
-                update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
+                update_contributor(contributor, current_timestamp, is_accurate);
                 updated_contributors.push(specific_data.contributor_reward_address);
             }
             contributor_count += 1;
         }
     }
-
     msg!("Consensus reached for TXID: {}, Status: {:?}, Hash: {}, Number of Contributors Included: {}", txid, consensus_status, consensus_hash, contributor_count);
 
     Ok(())
 }
 
 
-pub fn handle_consensus_failure(contributor_data_account: &mut Account<ContributorDataAccount>, contributor_address: Pubkey, current_time: u64) {
-    if let Some(contributor) = contributor_data_account.contributors.iter_mut().find(|c| c.reward_address == contributor_address) {
-        contributor.consensus_failures += 1;
-        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
-            // Apply temporary ban
-            contributor.ban_expiry = current_time + TEMPORARY_BAN_DURATION;
-        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
-            // Apply permanent ban
-            contributor.ban_expiry = u64::MAX;
-        }
-        msg!("Contributor Ban Update: Address: {}, Ban Expiry: {}", contributor.reward_address, contributor.ban_expiry);
-    }
+pub fn apply_permanent_bans(contributor_data_account: &mut Account<ContributorDataAccount>) {
+    // Collect addresses of contributors to be removed for efficient logging
+    let contributors_to_remove: Vec<String> = contributor_data_account.contributors.iter()
+        .filter(|c| c.ban_expiry == u64::MAX)
+        .map(|c| c.reward_address.to_string()) // Convert Pubkey to String
+        .collect();
+
+    // Log information about the removal process
+    msg!("Now removing permanently banned contributors! Total number of contributors before removal: {}, Number of contributors to be removed: {}, Addresses of contributors to be removed: {:?}",
+        contributor_data_account.contributors.len(), contributors_to_remove.len(), contributors_to_remove);
+
+    // Retain only contributors who are not permanently banned
+    contributor_data_account.contributors.retain(|c| c.ban_expiry != u64::MAX);
 }
 
-
-pub fn assess_and_apply_bans(contributor_data_account: &mut Account<ContributorDataAccount>, current_time: u64) {
-    let contributor_addresses: Vec<Pubkey> = contributor_data_account.contributors.iter().map(|c| c.reward_address).collect();
-
-    for contributor_address in contributor_addresses {
-        handle_consensus_failure(contributor_data_account, contributor_address, current_time);
-    }
-
-    contributor_data_account.contributors.retain(|c| !c.calculate_is_banned(current_time));
-}
 
 
 fn post_consensus_tasks(
@@ -302,15 +418,13 @@ fn post_consensus_tasks(
 ) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    // Call assess_and_apply_bans with ContributorDataAccount
-    assess_and_apply_bans(contributor_data_account, current_timestamp);
+    apply_permanent_bans(contributor_data_account);
 
     // Cleanup unneeded data in TempTxStatusReportAccount
     temp_report_account.reports.retain(|temp_report| {
         // Access the common data from the TempTxStatusReportAccount
         let common_data = &temp_report_account.common_reports[temp_report.common_data_ref as usize];
         let specific_data = &temp_report.specific_data;
-
         common_data.txid != txid && current_timestamp - specific_data.timestamp < DATA_RETENTION_PERIOD
     });
 
@@ -321,17 +435,17 @@ fn post_consensus_tasks(
 }
 
 
-fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxStatusReport, weight: u32, txid: &str) -> Result<()> {
-    let weight_i32 = weight as i32;
+fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxStatusReport, weight: f32, txid: &str) -> Result<()> {
+    let scaled_weight = (weight * 100.0) as i32; // Scaling by a factor of 100
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
     let data = state.aggregated_consensus_data.iter_mut().find(|d| d.txid == txid);
 
     if let Some(data_entry) = data {
         // Update existing data
-        data_entry.status_weights[report.txid_status as usize] += weight_i32;
+        data_entry.status_weights[report.txid_status as usize] += scaled_weight;
         if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            update_hash_weight(&mut data_entry.hash_weights, hash, weight_i32);
+            update_hash_weight(&mut data_entry.hash_weights, hash, scaled_weight);
         }
         data_entry.last_updated = current_timestamp;
     } else {
@@ -354,9 +468,9 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
             hash_weights: Vec::new(),
             last_updated: current_timestamp,
         };
-        new_data.status_weights[report.txid_status as usize] += weight_i32;
+        new_data.status_weights[report.txid_status as usize] += scaled_weight;
         if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            new_data.hash_weights.push(HashWeight { hash: hash.clone(), weight: weight_i32 });
+            new_data.hash_weights.push(HashWeight { hash: hash.clone(), weight: scaled_weight });
         }
         state.aggregated_consensus_data.push(new_data);
     }
@@ -399,18 +513,10 @@ pub fn submit_data_report_helper(
         return Err(OracleError::ContributorBanned.into());
     }    
 
-    // Fetch compliance score for further processing
-    let compliance_score = contributor.compliance_score;
-
-
     // Dereference to get the OracleContractState
     let state: &mut Account<'_, OracleContractState> = &mut ctx.accounts.oracle_contract_state;
     let temp_report_account: &mut TempTxStatusReportAccount = &mut ctx.accounts.temp_report_account;
 
-
-    // Validate the data report before any processing
-    msg!("Validating data report: {:?}", report);
-    validate_data_contributor_report(&report)?;
 
     // Check if the contributor is registered and not banned
     msg!("Checking if contributor is registered and not banned");
@@ -453,7 +559,10 @@ pub fn submit_data_report_helper(
     // Update submission count and consensus-related data
     msg!("Updating submission count and consensus-related data");
     update_submission_count(state, &txid)?;
-    let weight = normalize_compliance_score(compliance_score) as u32;
+
+    let compliance_score = contributor.compliance_score;
+    let reliability_score = contributor.reliability_score;
+    let weight: f32 = compliance_score + reliability_score;
     aggregate_consensus_data(state, &report, weight, &txid)?;
     
     // Check for consensus and perform related tasks
@@ -550,12 +659,12 @@ pub fn add_pending_payment_helper(
 pub struct Contributor {
     pub reward_address: Pubkey,
     pub registration_entrance_fee_transaction_signature: String,
-    pub compliance_score: i32,
+    pub compliance_score: f32,
     pub last_active_timestamp: u64,
     pub total_reports_submitted: u32,
     pub accurate_reports_count: u32,
     pub current_streak: u32,
-    pub reliability_score: u32,
+    pub reliability_score: f32,
     pub consensus_failures: u32,
     pub ban_expiry: u64,
     pub is_eligible_for_rewards: bool,
@@ -784,30 +893,6 @@ pub struct AggregatedConsensusData {
     pub last_updated: u64, // Unix timestamp indicating the last update time
 }
 
-#[derive(Accounts)]
-pub struct UpdateActivityAndCompliance<'info> {
-    #[account(mut)]
-    pub contributor_data_account: Account<'info, ContributorDataAccount>,    
-}
-
-pub fn update_activity_and_compliance(
-    ctx: Context<UpdateActivityAndCompliance>, 
-    contributor_address: Pubkey, // Passed as an argument
-    current_timestamp: u64, 
-    is_accurate: bool
-) -> Result<()> {
-    let contributor_data_account = &mut ctx.accounts.contributor_data_account;
-
-    // Find the contributor in the ContributorDataAccount
-    if let Some(contributor) = contributor_data_account.contributors.iter_mut().find(|c| c.reward_address == contributor_address) {
-        update_activity_and_compliance_helper(contributor, current_timestamp, is_accurate)?;
-    } else {
-        msg!("Contributor not found: {}", contributor_address);
-        return Err(OracleError::UnregisteredOracle.into());
-    }
-
-    Ok(())
-}
 
 #[derive(Accounts)]
 pub struct RequestReward<'info> {
@@ -912,12 +997,12 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     let new_contributor = Contributor {
         reward_address: *ctx.accounts.contributor_account.key,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
-        compliance_score: 0, // Initial compliance score
+        compliance_score: 1.0, // Initial compliance score
         last_active_timestamp, // Set the last active timestamp to the current time
         total_reports_submitted: 0, // Initially, no reports have been submitted
         accurate_reports_count: 0, // Initially, no accurate reports
         current_streak: 0, // No streak at the beginning
-        reliability_score: 0, // Initial reliability score
+        reliability_score: 1.0, // Initial reliability score
         consensus_failures: 0, // No consensus failures at the start
         ban_expiry: 0, // No ban initially set
         is_eligible_for_rewards: false, // Initially not eligible for rewards
@@ -931,134 +1016,6 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     // Logging for debug purposes
     msg!("New Contributor successfully Registered: Address: {}, Timestamp: {}", ctx.accounts.contributor_account.key, last_active_timestamp);
     Ok(())
-}
-
-
-fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
-    let time_diff = current_timestamp.saturating_sub(contributor.last_active_timestamp);
-    let days_inactive = time_diff as f32 / 86_400.0; // 86,400 seconds in a day
-    let progressive_scaling = if contributor.total_reports_submitted > 0 {
-        1.0 / (1.0 + (contributor.total_reports_submitted as f32 * 0.01).log10()).max(0.0).min(1.0)
-    } else {
-        1.0
-    };
-    let time_weight = (2.0_f32).powf(-days_inactive / 30.0); // Half-life of 30 days
-
-    let base_score_increment = 10;
-    let score_increment = (base_score_increment as f32 * progressive_scaling * time_weight) as i32;
-    let score_decrement = 5; // Fixed negative value for inaccuracies
-    let streak_bonus = if is_accurate { cmp::min(contributor.current_streak / 3, 5) as i32 } else { 0 };
-
-    msg!("Updating Scores: Address: {}, Time Diff: {}, Days Inactive: {}, Progressive Scaling: {}, Time Weight: {}, Base Score Increment: {}, Score Increment: {}, Score Decrement: {}, Streak Bonus: {}",
-        contributor.reward_address, time_diff, days_inactive, progressive_scaling, time_weight, base_score_increment, score_increment, score_decrement, streak_bonus);
-
-    if is_accurate {
-        contributor.accurate_reports_count += 1;
-        contributor.current_streak += 1;
-        contributor.compliance_score += score_increment + streak_bonus;
-    } else {
-        contributor.current_streak = 0;
-        contributor.compliance_score -= score_decrement;
-    }
-
-    contributor.compliance_score = cmp::min(cmp::max(contributor.compliance_score, -100), 100);
-    contributor.reliability_score = if contributor.total_reports_submitted > 0 {
-        ((contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32) * 100.0).min(100.0) as u32
-    } else {
-        0
-    };
-
-    msg!("Scores Updated: Address: {}, Compliance Score: {}, Reliability Score: {}",
-        contributor.reward_address, contributor.compliance_score, contributor.reliability_score);
-}
-
-
-fn apply_bans(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
-    if !is_accurate {
-        contributor.consensus_failures += 1;
-        msg!("Incremented Consensus Failures for Contributor: {}, New Count: {}", contributor.reward_address, contributor.consensus_failures);
-
-        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
-            contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
-            msg!("Temporary ban applied to Contributor: {}, Ban Expiry: {}", contributor.reward_address, contributor.ban_expiry);
-        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
-            contributor.ban_expiry = u64::MAX;
-            msg!("Permanent ban applied to Contributor: {}", contributor.reward_address);
-        }
-    }
-    
-    // Update the ban status based on current time
-    if current_timestamp < contributor.ban_expiry {
-        msg!("Contributor: {} is currently banned. Ban expiry: {}", contributor.reward_address, contributor.ban_expiry);
-    } else {
-        msg!("Contributor: {} is not currently banned.", contributor.reward_address);
-    }
-}
-
-fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
-    // Updating recently active status
-    let recent_activity_threshold = 86_400; // 24 hours in seconds
-    contributor.is_recently_active = current_timestamp - contributor.last_active_timestamp < recent_activity_threshold;
-    // msg!("Updated 'is_recently_active' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_recently_active);
-
-    // Updating reliability status
-    contributor.is_reliable = if contributor.total_reports_submitted > 0 {
-        let reliability_ratio = contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32;
-        reliability_ratio >= 0.8 // Example threshold for reliability
-    } else {
-        false
-    };
-    // msg!("Updated 'is_reliable' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_reliable);
-
-    // Updating eligibility for rewards
-    contributor.is_eligible_for_rewards = contributor.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
-        && contributor.reliability_score >= 80 
-        && contributor.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
-    // msg!("Updated 'is_eligible_for_rewards' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_eligible_for_rewards);
-}
-
-
-pub fn update_activity_and_compliance_helper(
-    contributor: &mut Contributor, 
-    current_timestamp: u64, 
-    is_accurate: bool,
-) -> Result<()> {
-    // Check if the contributor is banned before proceeding
-    if contributor.calculate_is_banned(current_timestamp) {
-        msg!("Contributor is currently banned and cannot be updated: {}", contributor.reward_address);
-        return Err(OracleError::ContributorBanned.into()); // Using a distinct error for clarity
-    }
-
-    // Updating scores
-    update_scores(contributor, current_timestamp, is_accurate);
-
-    // Applying bans based on report accuracy
-    apply_bans(contributor, current_timestamp, is_accurate);
-
-    // Updating contributor statuses
-    update_statuses(contributor, current_timestamp);
-
-    msg!("Contributor Update Complete: {}", contributor.reward_address);
-
-    Ok(())
-}
-
-
-pub fn update_bans_and_statuses(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
-    if !is_accurate {
-        contributor.consensus_failures += 1;
-        msg!("Incremented Consensus Failures: {}", contributor.consensus_failures);
-        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
-            contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
-            msg!("Temporary ban applied. Ban Expiry: {}", contributor.ban_expiry);
-        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
-            contributor.ban_expiry = u64::MAX;
-            msg!("Permanent ban applied.");
-        }
-    }
-    contributor.is_recently_active = contributor.calculate_is_recently_active(current_timestamp);
-    contributor.is_reliable = contributor.calculate_is_reliable();
-    contributor.is_eligible_for_rewards = contributor.calculate_is_eligible_for_rewards();
 }
 
 
@@ -1162,16 +1119,6 @@ pub fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<
     Ok(())
 }
 
-// Normalize the compliance score to a positive range, e.g., [0, 100]
-pub fn normalize_compliance_score(score: i32) -> i32 {
-    let max_score = 100;
-    let min_score = -100;
-    // Adjust score to be in the range [0, 200]
-    let adjusted_score = score - min_score;
-    // Scale down to be in the range [0, 100]
-    (adjusted_score * max_score) / (max_score - min_score)
-}
-
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
     match index {
         0 => Some(TxidStatus::Invalid),
@@ -1214,29 +1161,6 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
 
 impl Contributor {
 
-    // Method to check if the contributor is recently active
-    fn calculate_is_recently_active(&self, last_txid_request_time: u64) -> bool {
-        // Define a threshold for recent activity (e.g., active within the last 24 hours)
-        let recent_activity_threshold = 86_400; // seconds in 24 hours
-
-        // Convert `last_active_timestamp` to i64 for comparison
-        let last_active_timestamp_i64 = self.last_active_timestamp as i64;
-
-        // Check if the contributor was active after the last request was made
-        last_active_timestamp_i64 >= last_txid_request_time as i64 &&
-            Clock::get().unwrap().unix_timestamp - last_active_timestamp_i64 < recent_activity_threshold as i64
-    }
-
-    // Method to check if the contributor is reliable
-    fn calculate_is_reliable(&self) -> bool {
-        // Define what makes a contributor reliable; for example, a high reliability score which is a ratio of accurate reports to total reports
-        if self.total_reports_submitted == 0 {
-            return false; // Avoid division by zero
-        }
-        let reliability_ratio = self.accurate_reports_count as f32 / self.total_reports_submitted as f32;
-        reliability_ratio >= 0.8 // Example threshold for reliability, e.g., 80% accuracy
-    }    
-
     // Check if the contributor is currently banned
     pub fn calculate_is_banned(&self, current_time: u64) -> bool {
         current_time < self.ban_expiry
@@ -1245,7 +1169,7 @@ impl Contributor {
     // Method to determine if the contributor is eligible for rewards
     pub fn calculate_is_eligible_for_rewards(&self) -> bool {
         self.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
-            && self.reliability_score >= 80 
+            && self.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD 
             && self.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD
     }
 
