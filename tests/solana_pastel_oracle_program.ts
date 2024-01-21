@@ -19,8 +19,8 @@ const maxSize = 100 * 1024; // 200KB (max size of the oracle contract state acco
 const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
 const NUM_CONTRIBUTORS = 10;
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
-const MIN_REPORTS_FOR_REWARD = 10;
-const BAD_CONTRIBUTOR_INDEX = 8; // Define a constant to represent the index at which contributors are considered banned
+const MIN_REPORTS_FOR_REWARD = 12;
+const BAD_CONTRIBUTOR_INDEX = 7; // Define a constant to represent the index at which contributors are considered banned
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
 const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
@@ -332,9 +332,14 @@ describe('Data Report Submission', () => {
         const contributor = contributors[i];
         const rewardAddress = contributor.publicKey;
 
+        // Determine the probability of submitting an incorrect report
+        const errorProbability = i < BAD_CONTRIBUTOR_INDEX ? 0 : (i - BAD_CONTRIBUTOR_INDEX + 1) / (contributors.length - BAD_CONTRIBUTOR_INDEX);
+        const isIncorrect = Math.random() < errorProbability;
+
         // Randomize the status value for each report
-        const txidStatusValue = i < BAD_CONTRIBUTOR_INDEX ? TxidStatusEnum.MinedActivated : TxidStatusEnum.Invalid;
+        const txidStatusValue = isIncorrect ? TxidStatusEnum.Invalid : TxidStatusEnum.MinedActivated;
         const pastelTicketTypeValue = PastelTicketTypeEnum.Nft;
+
         console.log(`Status value for TXID ${txid} by contributor ${contributor.publicKey.toBase58()} is '${txidStatusValue}'; ticket type value is '${pastelTicketTypeValue}'`);
 
         const preimageString = seedPreamble + txid + rewardAddress.toBase58();

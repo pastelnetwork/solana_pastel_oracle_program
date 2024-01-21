@@ -252,28 +252,29 @@ fn apply_bans(contributor: &mut Contributor, current_timestamp: u64, is_accurate
 
 fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
     let time_diff = current_timestamp.saturating_sub(contributor.last_active_timestamp);
-    let hours_inactive: f32 = time_diff as f32 / 3_600.0; // 3,600 seconds in an hour
+    let hours_inactive: f32 = time_diff as f32 / 3_600.0;
 
-    // Progressive scaling adjustment
-    let progressive_scaling = if contributor.total_reports_submitted > 0 {
-        1.0 / (1.0 + (contributor.total_reports_submitted as f32 * 0.02).log2())
+    // Dynamic scaling for accuracy
+    let accuracy_scaling = if is_accurate {
+        (1.0 + contributor.current_streak as f32 * 0.1).min(2.0) // Increasing bonus for consecutive accuracy
     } else {
         1.0
     };
 
     let time_weight = 1.0 / (1.0 + hours_inactive / 480.0);
 
-    let base_score_increment = 3.0;
-    let score_increment = base_score_increment * progressive_scaling * time_weight;
-    let score_decrement = 20.0; // Significantly increased decrement for inaccuracies
+    let base_score_increment = 20.0; // Adjusted base increment for a more gradual increase
 
-    // More aggressive score decay
-    let decay_rate: f32 = 0.95;
-    let decay_factor = decay_rate.powf(hours_inactive / 24.0); // Decay applied daily
+    let score_increment = base_score_increment * accuracy_scaling * time_weight;
+
+    // Exponential penalty for inaccuracies
+    let score_decrement = 20.0 * (1.0 + contributor.consensus_failures as f32 * 0.5).min(3.0); 
+
+    let decay_rate: f32 = 0.99; // Adjusted decay rate
+    let decay_factor = decay_rate.powf(hours_inactive / 24.0);
 
     let streak_bonus = if is_accurate {
-        // Consider removing or reducing streak bonus
-        (contributor.current_streak as f32 / 20.0).min(1.0).max(0.0)
+        (contributor.current_streak as f32 / 10.0).min(3.0).max(0.0) // Enhanced streak bonus
     } else {
         0.0
     };
@@ -287,23 +288,18 @@ fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accur
         contributor.total_reports_submitted += 1;
         contributor.current_streak = 0;
         contributor.consensus_failures += 1;
-        contributor.compliance_score -= score_decrement;
+        contributor.compliance_score = (contributor.compliance_score - score_decrement).max(0.0);
     }
 
     contributor.compliance_score *= decay_factor;
 
-    msg!("Scores Before Logistic Scaling: Address: {}, Compliance Score: {}, Reliability Score: {}",
-        contributor.reward_address, contributor.compliance_score, contributor.reliability_score);
+    // Integrating reliability score into compliance score calculation
+    let reliability_factor = (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32).clamp(0.0, 1.0);
+    contributor.compliance_score = (contributor.compliance_score * reliability_factor).min(100.0);
 
-    // Adjust logistic scaling
-    contributor.compliance_score = logistic_scale(contributor.compliance_score, 100.0, 0.1, -200.0);
+    contributor.compliance_score = logistic_scale(contributor.compliance_score, 100.0, 0.1, 50.0); // Adjusted logistic scaling
 
-    // Reliability score normalization
-    contributor.reliability_score = if contributor.total_reports_submitted > 0 {
-        (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32) * 100.0
-    } else {
-        0.0
-    }.clamp(0.0, 100.0);
+    contributor.reliability_score = reliability_factor * 100.0;
 
     log_score_updates(contributor);
 }
