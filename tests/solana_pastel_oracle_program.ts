@@ -1055,3 +1055,34 @@ describe('Request Reward for Ineligible Contributor', () => {
     }
   });
 });
+
+
+// Remaining tests to add:
+
+// Reallocation of Oracle State:
+
+//     Test the functionality that allows dynamic reallocation of space for various program accounts.
+//     Simulate conditions where accounts reach their initial capacity and require reallocation to accommodate additional data.
+//     Ensure that during reallocation, no data is lost or corrupted, and the program maintains its integrity and performance.
+
+// Withdrawal of Funds:
+
+//     Verify that the withdrawal functionality works correctly, allowing the admin to securely withdraw funds from the reward pool and fee-receiving contract.
+//     Test different withdrawal scenarios, including partial withdrawals and attempts to withdraw amounts exceeding the account balances.
+//     Implement security tests to ensure that only the authorized admin can perform withdrawal actions, protecting against unauthorized access or exploitation.
+//     Validate the correct transfer and balance adjustments post-withdrawal, ensuring the program's accounting is accurate.
+
+// Reinitialization Prevention:
+// This testing ensures that program-derived accounts (PDAs) are not susceptible to unintended reinitialization, which could reset or corrupt the stored state.
+// Implement tests to attempt reinitialization of various accounts, particularly PDAs like OracleContractState, RewardPoolAccount, FeeReceivingContractAccount, etc., and verify that these attempts fail.
+// Such tests safeguard against vulnerabilities where an attacker or erroneous operation might reset critical state data, impacting the program's integrity.
+
+// Contract Upgrade Path:
+// If your program design includes provisions for future upgrades (a common practice in blockchain applications for scalability, feature addition, or bug fixes), it's crucial to test the upgrade process.
+// Simulate contract upgrades to ensure that the new version of the program maintains continuity with the existing state. This includes verifying that data in various accounts is preserved and remains consistent post-upgrade.
+// This aspect of testing is vital for ensuring that future upgrades do not disrupt the ongoing operations or data integrity of your program.
+
+// Resource Utilization and Cost Analysis:
+// Solana programs consume resources like compute units, and transactions have associated costs. It's important to analyze and test these aspects to optimize performance and cost-efficiency.
+// Perform tests to measure the resource utilization of various functions, especially those that are computationally intensive or called frequently. This helps identify potential bottlenecks or inefficiencies.
+// Analyze transaction costs to ensure that they align with expectations and are manageable within the economic model of your application. This is particularly important for functions that users will call frequently.
