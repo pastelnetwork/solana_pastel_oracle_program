@@ -5,7 +5,7 @@ use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
-const MIN_NUMBER_OF_ORACLES: usize = 10; // Minimum number of oracles to calculate consensus
+const MIN_NUMBER_OF_ORACLES: usize = 12; // Minimum number of oracles to calculate consensus
 const MIN_REPORTS_FOR_REWARD: u32 = 10; // Data Contributor must submit at least 10 reports to be eligible for rewards
 const MIN_COMPLIANCE_SCORE_FOR_REWARD: f32 = 65.0; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
 const MIN_RELIABILITY_SCORE_FOR_REWARD: f32 = 80.0; // Minimum reliability score to be eligible for rewards
@@ -46,8 +46,7 @@ pub enum OracleError {
     InvalidPastelTicketType,
     ContributorNotRegistered,
     ContributorBanned,
-    MemoryAllocationFailed,
-    UnauthorizedAccess
+    EnoughReportsSubmittedForTxid
 }
 
 impl From<OracleError> for ProgramError {
@@ -181,21 +180,30 @@ pub struct SubmitDataReport<'info> {
     #[account(mut, seeds = [b"contributor_data"], bump)]
     pub contributor_data_account: Account<'info, ContributorDataAccount>,
 
+    #[account(mut, seeds = [b"txid_submission_counts"], bump)]
+    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
+
+    #[account(mut, seeds = [b"aggregated_consensus_data"], bump)]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+
     pub system_program: Program<'info, System>,
 }
 
-fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Result<()> {
+fn update_submission_count(
+    txid_submission_counts_account: &mut Account<TxidSubmissionCountsAccount>, 
+    txid: &str
+) -> Result<()> {
     // Get the current timestamp
     let current_timestamp_u64 = Clock::get()?.unix_timestamp as u64;
 
     // Check if the txid already exists in the submission counts
-    if let Some(count) = state.txid_submission_counts.iter_mut().find(|c| c.txid == txid) {
+    if let Some(count) = txid_submission_counts_account.submission_counts.iter_mut().find(|c| c.txid == txid) {
         // Update the existing count
         count.count += 1;
         count.last_updated = current_timestamp_u64;
     } else {
         // Insert a new count if the txid does not exist
-        state.txid_submission_counts.push(TxidSubmissionCount {
+        txid_submission_counts_account.submission_counts.push(TxidSubmissionCount {
             txid: txid.to_string(),
             count: 1,
             last_updated: current_timestamp_u64,
@@ -204,7 +212,6 @@ fn update_submission_count(state: &mut OracleContractState, txid: &str) -> Resul
 
     Ok(())
 }
-
 
 pub fn get_report_account_pda(
     program_id: &Pubkey, 
@@ -218,8 +225,11 @@ pub fn get_report_account_pda(
 }
 
 
-fn get_aggregated_data<'a>(state: &'a OracleContractState, txid: &str) -> Option<&'a AggregatedConsensusData> {
-    state.aggregated_consensus_data.iter()
+fn get_aggregated_data<'a>(
+    aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
+    txid: &str
+) -> Option<&'a AggregatedConsensusData> {
+    aggregated_data_account.consensus_data.iter()
         .find(|data| data.txid == txid)
 }
 
@@ -317,7 +327,6 @@ fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
     // Updating recently active status
     let recent_activity_threshold = 86_400; // 24 hours in seconds
     contributor.is_recently_active = current_timestamp - contributor.last_active_timestamp < recent_activity_threshold;
-    msg!("Updated 'is_recently_active' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_recently_active);
 
     // Updating reliability status
     contributor.is_reliable = if contributor.total_reports_submitted > 0 {
@@ -326,13 +335,11 @@ fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
     } else {
         false
     };
-    msg!("Updated 'is_reliable' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_reliable);
 
     // Updating eligibility for rewards
     contributor.is_eligible_for_rewards = contributor.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
         && contributor.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD 
         && contributor.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
-    msg!("Updated 'is_eligible_for_rewards' status for Contributor: {}, Status: {}", contributor.reward_address, contributor.is_eligible_for_rewards);
 }
 
 fn update_contributor(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
@@ -350,19 +357,17 @@ fn update_contributor(contributor: &mut Contributor, current_timestamp: u64, is_
 
     // Updating contributor statuses
     update_statuses(contributor, current_timestamp);
-
-    msg!("Contributor Update Complete: {}", contributor.reward_address);
 }
 
 
 fn calculate_consensus(
-    state: &mut OracleContractState, 
+    aggregated_data_account: &Account<AggregatedConsensusDataAccount>,    
     temp_report_account: &TempTxStatusReportAccount,
     contributor_data_account: &mut Account<ContributorDataAccount>,
     txid: &str,
 ) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
-    let (consensus_status, consensus_hash) = get_aggregated_data(state, txid)
+    let (consensus_status, consensus_hash) = get_aggregated_data(aggregated_data_account, txid)
         .map(|data| compute_consensus(data))
         .unwrap_or((TxidStatus::Invalid, String::new()));
 
@@ -405,9 +410,9 @@ pub fn apply_permanent_bans(contributor_data_account: &mut Account<ContributorDa
 }
 
 
-
 fn post_consensus_tasks(
-    state: &mut OracleContractState, 
+    txid_submission_counts_account: &mut Account<TxidSubmissionCountsAccount>,    
+    aggregated_data_account: &mut Account<AggregatedConsensusDataAccount>,
     temp_report_account: &mut TempTxStatusReportAccount,
     contributor_data_account: &mut Account<ContributorDataAccount>,
     txid: &str,
@@ -416,6 +421,7 @@ fn post_consensus_tasks(
 
     apply_permanent_bans(contributor_data_account);
 
+    msg!("Now cleaning up unneeded data in TempTxStatusReportAccount...");
     // Cleanup unneeded data in TempTxStatusReportAccount
     temp_report_account.reports.retain(|temp_report| {
         // Access the common data from the TempTxStatusReportAccount
@@ -424,20 +430,34 @@ fn post_consensus_tasks(
         common_data.txid != txid && current_timestamp - specific_data.timestamp < DATA_RETENTION_PERIOD
     });
 
-    // Retain necessary aggregated consensus data in state
-    state.aggregated_consensus_data.retain(|data| current_timestamp - data.last_updated < DATA_RETENTION_PERIOD);
+    msg!("Now cleaning up unneeded data in AggregatedConsensusDataAccount...");
+    // Cleanup unneeded data in AggregatedConsensusDataAccount
+    aggregated_data_account.consensus_data.retain(|data| {
+        current_timestamp - data.last_updated < DATA_RETENTION_PERIOD
+    });
 
+    msg!("Now cleaning up unneeded data in TxidSubmissionCountsAccount...");
+    // Cleanup old submission counts in TxidSubmissionCountsAccount
+    txid_submission_counts_account.submission_counts.retain(|count| {
+        current_timestamp - count.last_updated < SUBMISSION_COUNT_RETENTION_PERIOD
+    });
+
+    msg!("Done with post-consensus tasks!");
     Ok(())
 }
 
 
-fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxStatusReport, weight: f32, txid: &str) -> Result<()> {
+fn aggregate_consensus_data(
+    aggregated_data_account: &mut Account<AggregatedConsensusDataAccount>, 
+    report: &PastelTxStatusReport, 
+    weight: f32, 
+    txid: &str
+) -> Result<()> {
     let scaled_weight = (weight * 100.0) as i32; // Scaling by a factor of 100
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    let data = state.aggregated_consensus_data.iter_mut().find(|d| d.txid == txid);
-
-    if let Some(data_entry) = data {
+    // Check if the txid already exists in the aggregated consensus data
+    if let Some(data_entry) = aggregated_data_account.consensus_data.iter_mut().find(|d| d.txid == txid) {
         // Update existing data
         data_entry.status_weights[report.txid_status as usize] += scaled_weight;
         if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
@@ -445,18 +465,6 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
         }
         data_entry.last_updated = current_timestamp;
     } else {
-        // Dynamically determine additional capacity needed
-        let additional_capacity = 1; // Assuming each new data typically requires space for one element
-        let max_capacity = 32 * 1024 / std::mem::size_of::<AggregatedConsensusData>(); // Calculate the maximum possible number of elements
-
-        if state.aggregated_consensus_data.len() + additional_capacity > max_capacity {
-            // Handle the case where we are at or near maximum capacity
-            return Err(OracleError::MemoryAllocationFailed.into());
-        } else if state.aggregated_consensus_data.len() == state.aggregated_consensus_data.capacity() {
-            // Only reserve additional capacity if needed
-            state.aggregated_consensus_data.reserve(additional_capacity);
-        }
-
         // Create new data
         let mut new_data = AggregatedConsensusData {
             txid: txid.to_string(),
@@ -468,7 +476,7 @@ fn aggregate_consensus_data(state: &mut OracleContractState, report: &PastelTxSt
         if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
             new_data.hash_weights.push(HashWeight { hash: hash.clone(), weight: scaled_weight });
         }
-        state.aggregated_consensus_data.push(new_data);
+        aggregated_data_account.consensus_data.push(new_data);
     }
 
     Ok(())
@@ -494,34 +502,43 @@ pub fn submit_data_report_helper(
     report: PastelTxStatusReport,
     contributor_reward_address: Pubkey
 ) -> ProgramResult {
+    // Directly access accounts from the context
+    let txid_submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount> = &mut ctx.accounts.txid_submission_counts_account;
+    let aggregated_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
+    let temp_report_account = &mut ctx.accounts.temp_report_account;
+    let contributor_data_account = &mut ctx.accounts.contributor_data_account;
+
+
+    // Retrieve the submission count for the given txid from the PDA account
+    let txid_submission_count: usize = txid_submission_counts_account.submission_counts.iter()
+        .find(|c| c.txid == txid).map_or(0, |c| c.count as usize);
+
+    // Check if the number of submissions is already at or exceeds MIN_NUMBER_OF_ORACLES
+    if txid_submission_count >= MIN_NUMBER_OF_ORACLES {
+        msg!("Enough reports have already been submitted for this txid");
+        return Err(OracleError::EnoughReportsSubmittedForTxid.into());
+    }    
+
     // Validate the data report before any contributor-specific checks
-    msg!("Validating data report: {:?}", report);
+    // msg!("Validating data report: {:?}", report);
     validate_data_contributor_report(&report)?;
 
     // Check if the contributor is registered and not banned
-    let contributor = ctx.accounts.contributor_data_account.contributors
+    // msg!("Checking if contributor is registered and not banned");    
+    let contributor = contributor_data_account.contributors
         .iter()
         .find(|c| c.reward_address == contributor_reward_address)
         .ok_or(OracleError::ContributorNotRegistered)?;
 
-    let is_banned = contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64);
-    if is_banned {
+    if contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64) {
         return Err(OracleError::ContributorBanned.into());
-    }    
-
-    // Dereference to get the OracleContractState
-    let state: &mut Account<'_, OracleContractState> = &mut ctx.accounts.oracle_contract_state;
-    let temp_report_account: &mut TempTxStatusReportAccount = &mut ctx.accounts.temp_report_account;
-
-
-    // Check if the contributor is registered and not banned
-    msg!("Checking if contributor is registered and not banned");
+    }
 
     // Clone the String before using it
     let first_6_characters_of_sha3_256_hash_of_corresponding_file = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.clone();
 
     // Extracting common data from the report
-    msg!("Extracting common data from the report");
+    // msg!("Extracting common data from the report");
     let common_data = CommonReportData {
         txid: report.txid.clone(),
         txid_status: report.txid_status,
@@ -530,11 +547,11 @@ pub fn submit_data_report_helper(
     };
 
     // Finding or adding common report data
-    msg!("Finding or adding common report data");
+    // msg!("Finding or adding common report data");
     let common_data_index = find_or_add_common_report_data(temp_report_account, &common_data);
 
     // Creating specific report data
-    msg!("Creating specific report data");
+    // msg!("Creating specific report data");
     let specific_report = SpecificReportData {
         contributor_reward_address,
         timestamp: report.timestamp,
@@ -542,43 +559,40 @@ pub fn submit_data_report_helper(
     };
 
     // Creating a temporary report entry
-    msg!("Creating a temporary report entry");
-    let temp_report = TempTxStatusReport {
+    // msg!("Creating a temporary report entry");
+    let temp_report: TempTxStatusReport = TempTxStatusReport {
         common_data_ref: common_data_index,
         specific_data: specific_report,
     };
 
     // Add the temporary report to the TempTxStatusReportAccount
-    msg!("Adding the temporary report to the TempTxStatusReportAccount");
+    // msg!("Adding the temporary report to the TempTxStatusReportAccount");
     temp_report_account.reports.push(temp_report);
 
     // Update submission count and consensus-related data
-    msg!("Updating submission count and consensus-related data");
-    update_submission_count(state, &txid)?;
+    // msg!("Updating submission count and consensus-related data");
+    update_submission_count(txid_submission_counts_account, &txid)?;
 
     let compliance_score = contributor.compliance_score;
     let reliability_score = contributor.reliability_score;
     let weight: f32 = compliance_score + reliability_score;
-    aggregate_consensus_data(state, &report, weight, &txid)?;
+    aggregate_consensus_data(aggregated_data_account, &report, weight, &txid)?;
     
     // Check for consensus and perform related tasks
-    msg!("Checking if consensus should be calculated...");
-    if should_calculate_consensus(state, &txid)? {
-        let contributor_data_account: &mut Account<'_, ContributorDataAccount> = &mut ctx.accounts.contributor_data_account;
+    if should_calculate_consensus(txid_submission_counts_account, &txid)? {
 
+        msg!("We now have enough reports to calculate consensus for txid: {}", txid);
+        
+        let contributor_data_account: &mut Account<'_, ContributorDataAccount> = &mut ctx.accounts.contributor_data_account;
         msg!("Calculating consensus...");
-        calculate_consensus(state, temp_report_account, contributor_data_account, &txid)?;
+        calculate_consensus(aggregated_data_account, temp_report_account, contributor_data_account, &txid)?;
 
         msg!("Performing post-consensus tasks...");
-        post_consensus_tasks(state, temp_report_account, contributor_data_account, &txid)?;
+        post_consensus_tasks(txid_submission_counts_account, aggregated_data_account, temp_report_account, contributor_data_account, &txid)?;
     }
-    
-    // Cleanup old submission counts
-    msg!("Cleaning up old submission counts...");
-    cleanup_old_submission_counts(state)?;
 
     // Log the new size of temp_tx_status_reports
-    msg!("New size of temp_tx_status_reports in bytes: {}", temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>());
+    msg!("New size of temp_tx_status_reports in bytes after processing report for txid {} from contributor {}: {}", txid, contributor_reward_address, temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>());
 
     Ok(())
 }
@@ -673,6 +687,16 @@ pub struct ContributorDataAccount {
     pub contributors: Vec<Contributor>,
 }
 
+#[account]
+pub struct TxidSubmissionCountsAccount {
+    pub submission_counts: Vec<TxidSubmissionCount>,
+}
+
+#[account]
+pub struct AggregatedConsensusDataAccount {
+    pub consensus_data: Vec<AggregatedConsensusData>,
+}
+
 
 #[account]
 pub struct OracleContractState {
@@ -682,9 +706,9 @@ pub struct OracleContractState {
     pub monitored_txids: Vec<String>,
     pub aggregated_consensus_data: Vec<AggregatedConsensusData>,
     pub reward_pool_account: Pubkey,
-    pub reward_pool_nonce: u8,
     pub fee_receiving_contract_account: Pubkey,
-    pub fee_receiving_contract_nonce: u8,
+    pub txid_submission_counts_account: Pubkey,    
+    pub aggregated_consensus_data_account: Pubkey,    
     pub bridge_contract_pubkey: Pubkey,
     pub active_reliable_contributors_count: u32,
 }
@@ -736,6 +760,26 @@ pub struct Initialize<'info> {
     )]
     pub contributor_data_account: Account<'info, ContributorDataAccount>,
 
+    // Account for TxidSubmissionCountsAccount PDA
+    #[account(
+        init,
+        seeds = [b"txid_submission_counts"],
+        bump,
+        payer = user,
+        space = 10_240
+    )]
+    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
+
+    // Account for AggregatedConsensusDataAccount PDA
+    #[account(
+        init,
+        seeds = [b"aggregated_consensus_data"],
+        bump,
+        payer = user,
+        space = 10_240
+    )]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+
     // System program is needed for account creation
     pub system_program: Program<'info, System>,    
 }
@@ -754,20 +798,14 @@ impl<'info> Initialize<'info> {
         state.admin_pubkey = admin_pubkey;
         msg!("Admin Pubkey set to: {:?}", admin_pubkey);
 
-        state.txid_submission_counts = Vec::new();
-        msg!("Txid Submission Counts Vector initialized");
+        // state.txid_submission_counts = Vec::new();
+        // msg!("Txid Submission Counts Vector initialized");
 
         state.monitored_txids = Vec::new();
         msg!("Monitored Txids Vector initialized");
 
-        state.aggregated_consensus_data = Vec::new();
-        msg!("Aggregated Consensus Data Vector initialized");
-
-        self.temp_report_account.reports = Vec::new();
-        msg!("TempTxStatusReportAccount initialized");        
-
-        self.contributor_data_account.contributors = Vec::new();
-        msg!("ContributorDataAccount initialized");
+        // state.aggregated_consensus_data = Vec::new();
+        // msg!("Aggregated Consensus Data Vector initialized");
 
         state.bridge_contract_pubkey = Pubkey::default();
         msg!("Bridge Contract Pubkey set to default");
@@ -791,6 +829,10 @@ pub struct ReallocateOracleState<'info> {
     pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
     #[account(mut)]
     pub contributor_data_account: Account<'info, ContributorDataAccount>,
+    #[account(mut)]
+    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
+    #[account(mut)]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 }
 
 pub fn reallocate_temp_report_account(temp_report_account: &mut Account<'_, TempTxStatusReportAccount>) -> Result<()> {
@@ -831,6 +873,43 @@ pub fn reallocate_contributor_data_account(contributor_data_account: &mut Accoun
     Ok(())
 }
 
+pub fn reallocate_submission_counts_account(submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount>) -> Result<()> {
+    // Define the threshold at which to reallocate (e.g., 90% full)
+    const REALLOCATION_THRESHOLD: f32 = 0.9;
+    const ADDITIONAL_SPACE: usize = 10_240;
+    const MAX_SIZE: usize = 100 * 1024;
+
+    let current_size = submission_counts_account.to_account_info().data_len();
+    let current_usage = submission_counts_account.submission_counts.len() * std::mem::size_of::<TxidSubmissionCount>();
+    let usage_ratio = current_usage as f32 / current_size as f32;
+
+    if usage_ratio > REALLOCATION_THRESHOLD {
+        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
+        submission_counts_account.to_account_info().realloc(new_size, false)?;
+        msg!("TxidSubmissionCountsAccount reallocated to new size: {}", new_size);
+    }
+    
+    Ok(())
+}
+
+pub fn reallocate_aggregated_consensus_data_account(aggregated_consensus_data_account: &mut Account<'_, AggregatedConsensusDataAccount>) -> Result<()> {
+    // Define the threshold at which to reallocate (e.g., 90% full)
+    const REALLOCATION_THRESHOLD: f32 = 0.9;
+    const ADDITIONAL_SPACE: usize = 10_240;
+    const MAX_SIZE: usize = 100 * 1024;
+
+    let current_size = aggregated_consensus_data_account.to_account_info().data_len();
+    let current_usage = aggregated_consensus_data_account.consensus_data.len() * std::mem::size_of::<AggregatedConsensusData>();
+    let usage_ratio = current_usage as f32 / current_size as f32;
+
+    if usage_ratio > REALLOCATION_THRESHOLD {
+        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
+        aggregated_consensus_data_account.to_account_info().realloc(new_size, false)?;
+        msg!("AggregatedConsensusDataAccount reallocated to new size: {}", new_size);
+    }
+    
+    Ok(())
+}
 
 impl<'info> ReallocateOracleState<'info> {
     pub fn execute(ctx: Context<ReallocateOracleState>) -> Result<()> {
@@ -850,6 +929,8 @@ impl<'info> ReallocateOracleState<'info> {
         
         reallocate_temp_report_account(&mut ctx.accounts.temp_report_account)?;
         reallocate_contributor_data_account(&mut ctx.accounts.contributor_data_account)?;
+        reallocate_submission_counts_account(&mut ctx.accounts.txid_submission_counts_account)?;
+        reallocate_aggregated_consensus_data_account(&mut ctx.accounts.aggregated_consensus_data_account)?;
         Ok(())
     }
 }
@@ -1080,21 +1161,18 @@ pub struct ProcessPastelTxStatusReport<'info> {
     // You can add other accounts as needed
 }
 
-pub fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Result<bool> {
+pub fn should_calculate_consensus(
+    txid_submission_counts_account: &Account<TxidSubmissionCountsAccount>, 
+    txid: &str
+) -> Result<bool> {
     // Retrieve the count of submissions and last updated timestamp for the given txid
-    let (submission_count, last_updated) = state.txid_submission_counts.iter()
+    let (submission_count, last_updated) = txid_submission_counts_account.submission_counts.iter()
         .find(|c| c.txid == txid)
         .map(|c| (c.count, c.last_updated))
         .unwrap_or((0, 0));
 
-    // Use the cached count of active reliable contributors
-    let active_reliable_contributors_count = state.active_reliable_contributors_count;
-
-    // Define the minimum number of reports required before attempting to calculate consensus
-    let min_reports_for_consensus = std::cmp::max(MIN_NUMBER_OF_ORACLES, active_reliable_contributors_count.try_into().unwrap());
-
     // Check if the minimum threshold of reports is met
-    let min_threshold_met = submission_count >= min_reports_for_consensus as u32;
+    let min_threshold_met = submission_count >= MIN_NUMBER_OF_ORACLES as u32;
 
     // Get the current unix timestamp from the Solana clock
     let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
@@ -1105,7 +1183,6 @@ pub fn should_calculate_consensus(state: &OracleContractState, txid: &str) -> Re
     // Calculate consensus if minimum threshold is met or if N minutes have passed with at least MIN_NUMBER_OF_ORACLES reports
     Ok(min_threshold_met || (max_waiting_period_elapsed_for_txid && submission_count >= MIN_NUMBER_OF_ORACLES as u32))
 }
-
 
 pub fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<()> {
     let current_time = Clock::get()?.unix_timestamp as u64;
@@ -1295,6 +1372,10 @@ pub mod solana_pastel_oracle_program {
         // Logging for Reward Pool and Fee Receiving Contract Accounts
         msg!("Reward Pool Account: {:?}", ctx.accounts.reward_pool_account.key());
         msg!("Fee Receiving Contract Account: {:?}", ctx.accounts.fee_receiving_contract_account.key());
+        msg!("Temp Report Account: {:?}", ctx.accounts.temp_report_account.key());
+        msg!("Contributor Data Account: {:?}", ctx.accounts.contributor_data_account.key());
+        msg!("Txid Submission Counts Account: {:?}", ctx.accounts.txid_submission_counts_account.key());
+        msg!("Aggregated Consensus Data Account: {:?}", ctx.accounts.aggregated_consensus_data_account.key());
     
         Ok(())
     }
@@ -1348,7 +1429,7 @@ pub mod solana_pastel_oracle_program {
         msg!("In `submit_data_report` function -- Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, contributor_addr={}",
             txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, contributor_reward_address);
     
-        // Convert the txid_status from string to enum
+        // Conversion logic remains the same
         let txid_status = match txid_status_str.as_str() {
             "Invalid" => TxidStatus::Invalid,
             "PendingMining" => TxidStatus::PendingMining,
@@ -1357,7 +1438,6 @@ pub mod solana_pastel_oracle_program {
             _ => return Err(ProgramError::from(OracleError::InvalidTxidStatus))
         };
     
-        // Convert the pastel_ticket_type from string to enum
         let pastel_ticket_type = match pastel_ticket_type_str.as_str() {
             "Sense" => PastelTicketType::Sense,
             "Cascade" => PastelTicketType::Cascade,
@@ -1366,10 +1446,8 @@ pub mod solana_pastel_oracle_program {
             _ => return Err(ProgramError::from(OracleError::InvalidPastelTicketType))
         };
     
-        // Fetch current timestamp from Solana's clock
         let timestamp = Clock::get()?.unix_timestamp as u64;
-
-        // Construct the report
+    
         let report = PastelTxStatusReport {
             txid: txid.clone(),
             txid_status,
@@ -1378,9 +1456,8 @@ pub mod solana_pastel_oracle_program {
             timestamp,
             contributor_reward_address,
         };
-
-        // Call the helper function to submit the report
-        submit_data_report_helper(ctx, txid, report, contributor_reward_address)    
+    
+        submit_data_report_helper(ctx, txid, report, contributor_reward_address)
     }
     
     pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
