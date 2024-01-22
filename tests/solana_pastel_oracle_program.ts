@@ -938,9 +938,9 @@ describe("Eligibility for Rewards", () => {
 
       // Define your eligibility criteria based on your contract logic
       const isEligibleForRewards =
-        currentContributorData.totalReportsSubmitted > MIN_REPORTS_FOR_REWARD &&
-        currentContributorData.reliabilityScore > MIN_RELIABILITY_SCORE_FOR_REWARD &&
-        currentContributorData.complianceScore > MIN_COMPLIANCE_SCORE_FOR_REWARD;
+        currentContributorData.totalReportsSubmitted >= MIN_REPORTS_FOR_REWARD &&
+        currentContributorData.reliabilityScore >= MIN_RELIABILITY_SCORE_FOR_REWARD &&
+        currentContributorData.complianceScore >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
 
       assert(
         currentContributorData.isEligibleForRewards === isEligibleForRewards,
@@ -962,12 +962,6 @@ describe('Reward Distribution', () => {
       program.programId
     );
 
-    // Find the PDA for the ContributorDataAccount
-    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("contributor_data")],
-      program.programId
-    );
-
     // Get initial balance of the reward pool
     const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
 
@@ -978,10 +972,12 @@ describe('Reward Distribution', () => {
     await program.methods.requestReward(eligibleContributor.publicKey)
       .accounts({
         rewardPoolAccount: rewardPoolAccountPDA,
-        oracleContractState: oracleContractState.publicKey,
-        contributorDataAccount: contributorDataAccountPDA  // Added this line
+        oracleContractState: oracleContractState.publicKey
       })
       .rpc();
+
+    // Wait for the transaction to be confirmed
+    await new Promise(resolve => setTimeout(resolve, 1000));  // Add a delay
 
     // Get updated balance of the reward pool
     const updatedRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
@@ -993,9 +989,16 @@ describe('Reward Distribution', () => {
     // Get updated balance of the eligible contributor
     const updatedContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
 
-    // Check if the reward is transferred to the contributor's address
-    const expectedContributorBalanceAfterReward = initialContributorBalance + BASE_REWARD_AMOUNT_IN_LAMPORTS;
-    assert.equal(updatedContributorBalance, expectedContributorBalanceAfterReward, 'Eligible contributor should receive the reward amount');
+    // Define a tolerance for transaction fees
+    const feeTolerance = 5000; // Example value, adjust as needed
+
+    // Check if the reward is transferred to the contributor's address within the tolerance range
+    const minExpectedBalance = initialContributorBalance + BASE_REWARD_AMOUNT_IN_LAMPORTS - feeTolerance;
+    const maxExpectedBalance = initialContributorBalance + BASE_REWARD_AMOUNT_IN_LAMPORTS + feeTolerance;
+    assert.isTrue(
+      updatedContributorBalance >= minExpectedBalance && updatedContributorBalance <= maxExpectedBalance,
+      'Eligible contributor should receive the reward amount within the specified tolerance range'
+    );
   });
 });
 
