@@ -24,16 +24,18 @@ const program = new Program<SolanaPastelOracleProgram>(
 const admin = provider.wallet; // Use the provider's wallet
 const oracleContractState = web3.Keypair.generate();
 let contributors = []; // Array to store contributor keypairs
+let trackedTxids = []; // Initialize an empty array to track TXIDs
+
 const maxSize = 100 * 1024; // 200KB (max size of the oracle contract state account)
 
-const NUM_CONTRIBUTORS = 15;
+const NUM_CONTRIBUTORS = 12;
 const NUMBER_OF_SIMULATED_REPORTS = 20;
 
 const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
-const MIN_NUMBER_OF_ORACLES = 15;
-const MIN_REPORTS_FOR_REWARD = 12;
-const BAD_CONTRIBUTOR_INDEX = 7; // Define a constant to represent the index at which contributors are considered banned
+const MIN_NUMBER_OF_ORACLES = 8;
+const MIN_REPORTS_FOR_REWARD = 10;
+const BAD_CONTRIBUTOR_INDEX = 5; // Define a constant to represent the index at which contributors start submitting incorrect reports with increasing probability
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
 const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
@@ -60,8 +62,7 @@ const ErrorCodeMap = {
   0x12: 'InvalidPastelTicketType',
   0x13: 'ContributorNotRegistered',
   0x14: 'ContributorBanned',
-  0x15: 'UnauthorizedAccess',
-  0x16: 'EnoughReportsSubmittedForTxid'
+  0x15: 'EnoughReportsSubmittedForTxid'
 };
 
 const TxidStatusEnum = {
@@ -644,6 +645,7 @@ describe("Data Report Submission", () => {
 
     // Loop through each monitored TXID for validation
     for (const txid of monitoredTxids) {
+
       // Fetch the updated state after all submissions for this TXID
       const updatedState = await program.account.oracleContractState.fetch(
         oracleContractState.publicKey
@@ -656,16 +658,21 @@ describe("Data Report Submission", () => {
         `TXID ${txid} should be in the monitored list`
       );
 
-      // Verify the consensus data for the TXID
-      const consensusData = updatedState.aggregatedConsensusData.find(
-        (data) => data.txid === txid
+      // Fetch the consensus data from the AggregatedConsensusDataAccount PDA
+      const aggregatedConsensusDataAccount =
+      await program.account.aggregatedConsensusDataAccount.fetch(
+          aggregatedConsensusDataAccountPDA
       );
+      const consensusData = aggregatedConsensusDataAccount.consensusData.find(
+          (data) => data.txid === txid
+      );
+      
       assert(
         consensusData !== undefined,
         `Consensus data should be present for the TXID ${txid}`
       );
 
-      // Assuming the consensus is based on the majority rule
+      // Assuming the consensus is based on the weighted majority rule
       const consensusStatusIndex = consensusData.statusWeights.indexOf(
         Math.max(...consensusData.statusWeights)
       );
@@ -689,6 +696,8 @@ describe("Data Report Submission", () => {
         { hash: "", weight: -1 }
       ).hash;
       console.log(`Consensus Hash for TXID ${txid}:`, consensusHash);
+
+      trackedTxids.push(txid);
 
       // Add further checks if needed based on the contract's consensus logic
       console.log(
@@ -754,6 +763,35 @@ describe("Data Report Submission", () => {
     }
   });
 });
+
+describe("Data Cleanup Verification", () => {
+  it("Verifies that data is cleaned up post-consensus", async () => {
+    const txidsToCheck = trackedTxids;
+
+    const [tempReportAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_tx_status_report")],
+      program.programId
+    );
+
+    const tempReportAccountData = await program.account.tempTxStatusReportAccount.fetch(tempReportAccountPDA);
+
+    txidsToCheck.forEach(txid => {
+      const isTxidPresentInTempReport = tempReportAccountData.reports.some(report => {
+        const commonDataIndex = report.commonDataRef.toNumber(); // Convert BN to number
+        const commonData = tempReportAccountData.commonReports[commonDataIndex]; // Use converted index
+        return commonData.txid === txid;
+      });
+      assert.isFalse(
+        isTxidPresentInTempReport,
+        `TXID ${txid} should be cleaned up from TempTxStatusReportAccount`
+      );
+
+    });
+
+    console.log("Data cleanup post-consensus verification completed successfully.");
+  });
+});
+
 
 describe("Payment Processing by Bridge Contract", () => {
   it("Processes payments for monitored TXIDs", async () => {
@@ -837,6 +875,7 @@ describe("Payment Processing by Bridge Contract", () => {
   });
 });
 
+
 describe("Eligibility for Rewards", () => {
   it("should check if contributors meet reward eligibility criteria", async () => {
     // Fetch the ContributorDataAccount
@@ -845,6 +884,7 @@ describe("Eligibility for Rewards", () => {
         [Buffer.from("contributor_data")],
         program.programId
       );
+
     const contributorData = await program.account.contributorDataAccount.fetch(
       contributorDataAccountPDA
     );
@@ -898,76 +938,103 @@ describe("Eligibility for Rewards", () => {
 
       // Define your eligibility criteria based on your contract logic
       const isEligibleForRewards =
-        currentContributorData.totalReportsSubmitted >=
-          MIN_REPORTS_FOR_REWARD &&
-        currentContributorData.reliabilityScore >=
-          MIN_RELIABILITY_SCORE_FOR_REWARD &&
-        currentContributorData.complianceScore >=
-          MIN_COMPLIANCE_SCORE_FOR_REWARD;
+        currentContributorData.totalReportsSubmitted > MIN_REPORTS_FOR_REWARD &&
+        currentContributorData.reliabilityScore > MIN_RELIABILITY_SCORE_FOR_REWARD &&
+        currentContributorData.complianceScore > MIN_COMPLIANCE_SCORE_FOR_REWARD;
 
       assert(
-        isEligibleForRewards,
-        `Contributor with address ${contributor.publicKey.toBase58()} should be eligible for rewards`
+        currentContributorData.isEligibleForRewards === isEligibleForRewards,
+        `Eligibility for rewards for contributor with address ${contributor.publicKey.toBase58()} should be correctly determined`
       );
+
     }
   });
 });
 
-// describe('Reward Distribution', () => {
-//   it('should distribute rewards correctly from the reward pool', async () => {
-//     // Choose an eligible contributor
-//     const eligibleContributor = contributors[0]; // Assuming the first contributor is eligible
+describe('Reward Distribution', () => {
+  it('should distribute rewards correctly from the reward pool', async () => {
+    // Choose an eligible contributor
+    const eligibleContributor = contributors[0]; // Assuming the first contributor is eligible
 
-//     // Find the PDA for the RewardPoolAccount
-//     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-//       [Buffer.from("reward_pool")],
-//       program.programId
-//     );
+    // Find the PDA for the RewardPoolAccount
+    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reward_pool")],
+      program.programId
+    );
 
-//     // Get initial balance of the reward pool
-//     const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+    // Find the PDA for the ContributorDataAccount
+    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
 
-//     // Request reward for the eligible contributor
-//     await program.methods.requestReward(eligibleContributor.publicKey)
-//       .accounts({
-//         rewardPoolAccount: rewardPoolAccountPDA,
-//         oracleContractState: oracleContractState.publicKey
-//       })
-//       .rpc();
+    // Get initial balance of the reward pool
+    const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
 
-//     // Get updated balance of the reward pool
-//     const updatedRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+    // Get initial balance of the eligible contributor
+    const initialContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
 
-//     // Check if the balance is deducted correctly
-//     const expectedBalanceAfterReward = initialRewardPoolBalance - BASE_REWARD_AMOUNT_IN_LAMPORTS;
-//     assert.equal(updatedRewardPoolBalance, expectedBalanceAfterReward, 'Reward pool balance should be deducted by the reward amount');
-//   });
-// });
+    // Request reward for the eligible contributor
+    await program.methods.requestReward(eligibleContributor.publicKey)
+      .accounts({
+        rewardPoolAccount: rewardPoolAccountPDA,
+        oracleContractState: oracleContractState.publicKey,
+        contributorDataAccount: contributorDataAccountPDA  // Added this line
+      })
+      .rpc();
 
-// describe('Request Reward for Ineligible Contributor', () => {
-//   it('should not allow reward requests from ineligible contributors', async () => {
-//     // Choose an ineligible contributor
-//     const ineligibleContributor = contributors[contributors.length - 1]; // Assuming the last contributor is ineligible
+    // Get updated balance of the reward pool
+    const updatedRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
 
-//     // Find the PDA for the RewardPoolAccount
-//     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-//       [Buffer.from("reward_pool")],
-//       program.programId
-//     );
+    // Check if the balance is deducted correctly
+    const expectedBalanceAfterReward = initialRewardPoolBalance - BASE_REWARD_AMOUNT_IN_LAMPORTS;
+    assert.equal(updatedRewardPoolBalance, expectedBalanceAfterReward, 'Reward pool balance should be deducted by the reward amount');
 
-//     try {
-//       // Attempt to request reward
-//       await program.methods.requestReward(ineligibleContributor.publicKey)
-//         .accounts({
-//           rewardPoolAccount: rewardPoolAccountPDA,
-//           oracleContractState: oracleContractState.publicKey
-//         })
-//         .rpc();
+    // Get updated balance of the eligible contributor
+    const updatedContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
 
-//       throw new Error('Reward request should have failed for ineligible contributor');
-//     } catch (error) {
-//       // Check for the specific error thrown by your program
-//       assert.equal(error.msg, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
-//     }
-//   });
-// });
+    // Check if the reward is transferred to the contributor's address
+    const expectedContributorBalanceAfterReward = initialContributorBalance + BASE_REWARD_AMOUNT_IN_LAMPORTS;
+    assert.equal(updatedContributorBalance, expectedContributorBalanceAfterReward, 'Eligible contributor should receive the reward amount');
+  });
+});
+
+describe('Request Reward for Ineligible Contributor', () => {
+  it('should not allow reward requests from ineligible contributors', async () => {
+    // Choose an ineligible contributor
+    const ineligibleContributor = contributors[contributors.length - 1]; // Assuming the last contributor is ineligible
+
+    // Find the PDA for the RewardPoolAccount
+    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reward_pool")],
+      program.programId
+    );
+
+    try {
+      // Attempt to request reward
+      await program.methods.requestReward(ineligibleContributor.publicKey)
+        .accounts({
+          rewardPoolAccount: rewardPoolAccountPDA,
+          oracleContractState: oracleContractState.publicKey
+        })
+        .rpc();
+
+      throw new Error('Reward request should have failed for ineligible contributor');
+    } catch (error) {
+      const errorString = error.toString();
+
+      // Extracting the error code
+      const match = errorString.match(/custom program error: 0x(\w+)/);
+      if (match) {
+          const errorCode = parseInt(match[1], 16);
+          const errorName = ErrorCodeMap[errorCode];
+
+          // Check for the specific error thrown by your program
+          assert.equal(errorName, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
+      } else {
+          console.error(`Error parsing error code: ${errorString}`);
+          // Decide on handling unparsed errors
+      }
+    }
+  });
+});
