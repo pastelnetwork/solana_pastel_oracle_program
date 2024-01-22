@@ -951,7 +951,7 @@ describe("Eligibility for Rewards", () => {
   });
 });
 
-describe('Reward Distribution', () => {
+describe('Reward Distribution for Eligible Contributor', () => {
   it('should distribute rewards correctly from the reward pool', async () => {
     // Choose an eligible contributor
     const eligibleContributor = contributors[0]; // Assuming the first contributor is eligible
@@ -961,6 +961,12 @@ describe('Reward Distribution', () => {
       [Buffer.from("reward_pool")],
       program.programId
     );
+
+    const [contributorDataAccountPDA] =
+      await web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("contributor_data")],
+        program.programId
+      );
 
     // Get initial balance of the reward pool
     const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
@@ -972,7 +978,8 @@ describe('Reward Distribution', () => {
     await program.methods.requestReward(eligibleContributor.publicKey)
       .accounts({
         rewardPoolAccount: rewardPoolAccountPDA,
-        oracleContractState: oracleContractState.publicKey
+        oracleContractState: oracleContractState.publicKey,
+        contributorDataAccount: contributorDataAccountPDA
       })
       .rpc();
 
@@ -1013,12 +1020,19 @@ describe('Request Reward for Ineligible Contributor', () => {
       program.programId
     );
 
+    const [contributorDataAccountPDA] =
+      await web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("contributor_data")],
+        program.programId
+      );
+
     try {
       // Attempt to request reward
       await program.methods.requestReward(ineligibleContributor.publicKey)
         .accounts({
           rewardPoolAccount: rewardPoolAccountPDA,
-          oracleContractState: oracleContractState.publicKey
+          oracleContractState: oracleContractState.publicKey,
+          contributorDataAccount: contributorDataAccountPDA
         })
         .rpc();
 
