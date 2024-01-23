@@ -464,12 +464,17 @@ fn aggregate_consensus_data(
             update_hash_weight(&mut data_entry.hash_weights, hash, scaled_weight);
         }
         data_entry.last_updated = current_timestamp;
+        // Handling the Option<String> here
+        data_entry.first_6_characters_of_sha3_256_hash_of_corresponding_file = 
+            report.first_6_characters_of_sha3_256_hash_of_corresponding_file.clone().unwrap_or_default();
     } else {
         // Create new data
         let mut new_data = AggregatedConsensusData {
             txid: txid.to_string(),
             status_weights: [0; TXID_STATUS_VARIANT_COUNT],
             hash_weights: Vec::new(),
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: 
+                report.first_6_characters_of_sha3_256_hash_of_corresponding_file.clone().unwrap_or_default(),
             last_updated: current_timestamp,
         };
         new_data.status_weights[report.txid_status as usize] += scaled_weight;
@@ -704,13 +709,11 @@ pub struct OracleContractState {
     pub admin_pubkey: Pubkey,
     pub txid_submission_counts: Vec<TxidSubmissionCount>,
     pub monitored_txids: Vec<String>,
-    pub aggregated_consensus_data: Vec<AggregatedConsensusData>,
     pub reward_pool_account: Pubkey,
     pub fee_receiving_contract_account: Pubkey,
     pub txid_submission_counts_account: Pubkey,    
     pub aggregated_consensus_data_account: Pubkey,    
     pub bridge_contract_pubkey: Pubkey,
-    pub active_reliable_contributors_count: u32,
 }
 
 
@@ -798,20 +801,11 @@ impl<'info> Initialize<'info> {
         state.admin_pubkey = admin_pubkey;
         msg!("Admin Pubkey set to: {:?}", admin_pubkey);
 
-        // state.txid_submission_counts = Vec::new();
-        // msg!("Txid Submission Counts Vector initialized");
-
         state.monitored_txids = Vec::new();
         msg!("Monitored Txids Vector initialized");
 
-        // state.aggregated_consensus_data = Vec::new();
-        // msg!("Aggregated Consensus Data Vector initialized");
-
         state.bridge_contract_pubkey = Pubkey::default();
         msg!("Bridge Contract Pubkey set to default");
-
-        state.active_reliable_contributors_count = 0;
-        msg!("Active Reliable Contributors Count set to 0");
 
         msg!("Oracle Contract State Initialization Complete");
         Ok(())
@@ -967,6 +961,7 @@ pub struct AggregatedConsensusData {
     pub txid: String,
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
     pub hash_weights: Vec<HashWeight>,
+    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
     pub last_updated: u64, // Unix timestamp indicating the last update time
 }
 
