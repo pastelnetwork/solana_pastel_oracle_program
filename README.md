@@ -459,3 +459,64 @@ The scoring system for contributors is a crucial aspect of the program, affectin
 8. **Transfer Reward**:
    - The function transfers the reward amount from the reward pool account to the contributor's account.
    - This involves decrementing the lamports in the reward pool account and incrementing the lamports in the contributor's account.
+
+## Explanation of Typescript Testing Script
+
+### Initialization
+
+1. **Environment Setup**:
+   - The program sets up environment variables for the Anchor provider URL and logging.
+   - It initializes the Anchor provider and sets it as the default provider for the program.
+
+2. **Program and Account Setup**:
+   - The program ID and the oracle contract state account are defined.
+   - Public Key Address (PDA) accounts for various purposes (e.g., reward pool, fee receiving contract, contributor data, TXID submission counts, and aggregated consensus data) are generated using `web3.PublicKey.findProgramAddressSync`.
+
+3. **Funding the Oracle Contract State Account**:
+   - The oracle contract state account is funded with enough SOL to cover the rent-exempt minimum balance required by the Solana network.
+
+4. **Initialization and Reallocation**:
+   - The program initializes the oracle contract state, setting up initial parameters and PDAs.
+   - The contract state is expanded incrementally to accommodate additional data, up to a maximum size of 200KB.
+
+### Contributor Registration
+
+1. **Contributor Registration**:
+   - Contributors are registered by generating new keypairs and paying a registration entrance fee.
+   - The program transfers the registration fee to the fee receiving contract account PDA.
+   - New contributors are added to the ContributorDataAccount PDA.
+
+### TXID Monitoring
+
+1. **Adding TXIDs for Monitoring**:
+   - The program generates random TXIDs and adds them for monitoring.
+   - Each TXID is associated with a pending payment account, which is initialized with the expected payment amount.
+   - The TXID is then added to the monitored list in the oracle contract state.
+
+2. **Verification of Monitored TXIDs**:
+   - The program verifies that all monitored TXIDs have corresponding pending payment structs.
+   - It checks the payment status and ensures the expected amount matches the defined cost.
+
+### Data Report Submission
+
+1. **Submitting Data Reports**:
+   - Contributors submit data reports for the monitored TXIDs.
+   - Reports include TXID status, pastel ticket type, and a random file hash.
+   - The program handles both correct and incorrect submissions based on a predefined error probability.
+
+2. **Consensus Data**:
+   - The program aggregates consensus data for each TXID based on the submitted reports.
+   - It determines the majority consensus status and logs the results.
+
+### Payment Processing
+
+1. **Processing Payments**:
+   - The program processes payments for the monitored TXIDs by transferring the payment amount from the admin account to the fee-receiving contract PDA.
+   - It updates the payment status to "Received" and verifies the changes.
+
+### Reward Distribution
+
+1. **Eligibility Check and Reward Distribution**:
+   - The program checks if contributors meet the criteria for reward eligibility based on their compliance and reliability scores.
+   - Eligible contributors receive rewards from the reward pool account PDA.
+   - The program verifies that reward distribution is accurate and logs the changes in account balances.
