@@ -974,47 +974,50 @@ pub struct RequestReward<'info> {
     pub oracle_contract_state: Account<'info, OracleContractState>,
     #[account(mut)]
     pub contributor_data_account: Account<'info, ContributorDataAccount>,
+    /// CHECK: This is the account we're transferring lamports to
+    #[account(mut)]
+    pub contributor: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
 }
 
 
 pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
-
-    // Temporarily store reward eligibility and amount
-    let mut reward_amount = 0;
-    let mut is_reward_valid = false;
+    let contributor_data_account = &ctx.accounts.contributor_data_account;
+    let reward_pool_account = &ctx.accounts.reward_pool_account;
+    let contributor_account = &ctx.accounts.contributor;
 
     // Find the contributor in the PDA and check eligibility
-    if let Some(contributor) = ctx.accounts.contributor_data_account.contributors.iter().find(|c| c.reward_address == contributor_address) {
-        let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
-        let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
-        let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
+    let contributor = contributor_data_account.contributors.iter().find(|c| c.reward_address == contributor_address)
+        .ok_or(OracleError::UnregisteredOracle)?;
 
-        if is_eligible_for_rewards && !is_banned {
-            reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
-            is_reward_valid = true;
-        }
-    } else {
-        msg!("Contributor not found: {}", contributor_address);
-        return Err(OracleError::UnregisteredOracle.into());
-    }
-
-    // Handle reward transfer after determining eligibility
-    if is_reward_valid {
-        // Transfer the reward from the reward pool to the contributor
-        **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
-        **ctx.accounts.oracle_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
-
-        msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
-    } else {
-
-        msg!("Invalid Reward Request: Contributor: {}", contributor_address);
+    let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+    
+    if !contributor.is_eligible_for_rewards {
+        msg!("Contributor is not eligible for rewards: {}", contributor_address);
         return Err(OracleError::NotEligibleForReward.into());
     }
 
+    if contributor.calculate_is_banned(current_unix_timestamp) {
+        msg!("Contributor is banned: {}", contributor_address);
+        return Err(OracleError::ContributorBanned.into());
+    }
+
+    let reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS;
+
+    // Ensure the reward pool has sufficient funds
+    if reward_pool_account.to_account_info().lamports() < reward_amount {
+        msg!("Insufficient funds in reward pool");
+        return Err(OracleError::InsufficientFunds.into());
+    }
+
+    // Transfer the reward from the reward pool to the contributor
+    **reward_pool_account.to_account_info().try_borrow_mut_lamports()? -= reward_amount;
+    **contributor_account.to_account_info().try_borrow_mut_lamports()? += reward_amount;
+
+    msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
+
     Ok(())
 }
-
 
 #[derive(Accounts)]
 pub struct RegisterNewDataContributor<'info> {

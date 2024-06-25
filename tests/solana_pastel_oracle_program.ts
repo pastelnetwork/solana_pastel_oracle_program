@@ -4,9 +4,9 @@ import {
   SolanaPastelOracleProgram,
   IDL,
 } from "../target/types/solana_pastel_oracle_program";
-import { assert } from "chai";
+import { assert, expect } from "chai";
 import * as crypto from "crypto";
-const { ComputeBudgetProgram, Transaction } = anchor.web3;
+const { ComputeBudgetProgram, Transaction, PublicKey } = anchor.web3;
 
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 process.env.RUST_LOG =
@@ -957,55 +957,67 @@ describe('Reward Distribution for Eligible Contributor', () => {
     const eligibleContributor = contributors[0]; // Assuming the first contributor is eligible
 
     // Find the PDA for the RewardPoolAccount
-    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddress(
       [Buffer.from("reward_pool")],
       program.programId
     );
 
-    const [contributorDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("contributor_data")],
-        program.programId
-      );
+    const [contributorDataAccountPDA] = await web3.PublicKey.findProgramAddress(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
 
-    // Get initial balance of the reward pool
+    // Get initial balances
     const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+    console.log(`Initial reward pool balance: ${initialRewardPoolBalance}`);
 
-    // Get initial balance of the eligible contributor
     const initialContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
+    console.log(`Initial contributor balance: ${initialContributorBalance}`);
 
-    // Request reward for the eligible contributor
-    await program.methods.requestReward(eligibleContributor.publicKey)
-      .accounts({
-        rewardPoolAccount: rewardPoolAccountPDA,
-        oracleContractState: oracleContractState.publicKey,
-        contributorDataAccount: contributorDataAccountPDA
-      })
-      .rpc();
+    const initialOracleContractStateBalance = await provider.connection.getBalance(oracleContractState.publicKey);
+    console.log(`Initial oracle contract state balance: ${initialOracleContractStateBalance}`);
+
+    try {
+      // Request reward for the eligible contributor
+      await program.methods.requestReward(eligibleContributor.publicKey)
+        .accounts({
+          rewardPoolAccount: rewardPoolAccountPDA,
+          oracleContractState: oracleContractState.publicKey,
+          contributorDataAccount: contributorDataAccountPDA,
+          contributor: eligibleContributor.publicKey,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .rpc();
+
+      console.log("Reward request successful");
+    } catch (error) {
+      console.error("Error requesting reward:", error);
+      throw error;
+    }
 
     // Wait for the transaction to be confirmed
-    await new Promise(resolve => setTimeout(resolve, 1000));  // Add a delay
+    await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Get updated balance of the reward pool
+    // Get updated balances
     const updatedRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+    console.log(`Updated reward pool balance: ${updatedRewardPoolBalance}`);
 
-    // Check if the balance is deducted correctly
-    const expectedBalanceAfterReward = initialRewardPoolBalance - BASE_REWARD_AMOUNT_IN_LAMPORTS;
-    assert.equal(updatedRewardPoolBalance, expectedBalanceAfterReward, 'Reward pool balance should be deducted by the reward amount');
-
-    // Get updated balance of the eligible contributor
     const updatedContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
+    console.log(`Updated contributor balance: ${updatedContributorBalance}`);
 
-    // Define a tolerance for transaction fees
-    const feeTolerance = 5000; // Example value, adjust as needed
+    const updatedOracleContractStateBalance = await provider.connection.getBalance(oracleContractState.publicKey);
+    console.log(`Updated oracle contract state balance: ${updatedOracleContractStateBalance}`);
 
-    // Check if the reward is transferred to the contributor's address within the tolerance range
-    const minExpectedBalance = initialContributorBalance + BASE_REWARD_AMOUNT_IN_LAMPORTS - feeTolerance;
-    const maxExpectedBalance = initialContributorBalance + BASE_REWARD_AMOUNT_IN_LAMPORTS + feeTolerance;
-    assert.isTrue(
-      updatedContributorBalance >= minExpectedBalance && updatedContributorBalance <= maxExpectedBalance,
-      'Eligible contributor should receive the reward amount within the specified tolerance range'
-    );
+    // Check if the reward pool balance decreased by the correct amount
+    const rewardPoolDifference = initialRewardPoolBalance - updatedRewardPoolBalance;
+    expect(rewardPoolDifference).to.equal(BASE_REWARD_AMOUNT_IN_LAMPORTS, "Reward pool should decrease by the reward amount");
+
+    // Check if the contributor balance increased by the correct amount
+    const contributorDifference = updatedContributorBalance - initialContributorBalance;
+    expect(contributorDifference).to.equal(BASE_REWARD_AMOUNT_IN_LAMPORTS, "Contributor balance should increase by the reward amount");
+
+    // The oracle contract state balance should not change
+    expect(updatedOracleContractStateBalance).to.equal(initialOracleContractStateBalance, "Oracle contract state balance should not change");
   });
 });
 
