@@ -2,10 +2,11 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program, web3, AnchorProvider, BN } from "@coral-xyz/anchor";
 import {
   SolanaPastelOracleProgram,
-  IDL,
 } from "../target/types/solana_pastel_oracle_program";
+import IDL from "../target/idl/solana_pastel_oracle_program.json";
 import { assert, expect } from "chai";
 import * as crypto from "crypto";
+import { SystemProgram } from "@solana/web3.js";
 const { ComputeBudgetProgram, Transaction, PublicKey } = anchor.web3;
 
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
@@ -13,12 +14,8 @@ process.env.RUST_LOG =
   "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
-const programID = new anchor.web3.PublicKey(
-  "AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNbKAsH2sBsB"
-);
 const program = new Program<SolanaPastelOracleProgram>(
-  IDL,
-  programID,
+  IDL as any,
   provider
 );
 const admin = provider.wallet; // Use the provider's wallet
@@ -79,39 +76,39 @@ const PastelTicketTypeEnum = {
   InferenceApi: "InferenceApi",
 };
 
-console.log("Program ID:", programID.toString());
+console.log("Program ID:", program.programId.toString());
 console.log("Admin ID:", admin.publicKey.toString());
 
 describe("Initialization", () => {
   it("Initializes and expands the oracle contract state", async () => {
     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
-    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("reward_pool")],
       program.programId
     );
     const [feeReceivingContractAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("fee_receiving_contract")],
         program.programId
       );
 
     // Find the PDA for the ContributorDataAccount
     const [contributorDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("contributor_data")],
         program.programId
       );
 
     // Find the PDA for the TxidSubmissionCountsAccount
     const [txidSubmissionCountsAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("txid_submission_counts")],
         program.programId
       );
 
     // Find the PDA for the AggregatedConsensusDataAccount
     const [aggregatedConsensusDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("aggregated_consensus_data")],
         program.programId
       );
@@ -144,13 +141,13 @@ describe("Initialization", () => {
     // Initial Initialization
     console.log("Initializing Oracle Contract State");
     await program.methods
-      .initialize(admin.publicKey)
-      .accounts({
+      .initialize()
+      .accountsStrict({
         oracleContractState: oracleContractState.publicKey,
         contributorDataAccount: contributorDataAccountPDA,
         user: admin.publicKey,
-        rewardPoolAccount: rewardPoolAccountPDA,
-        feeReceivingContractAccount: feeReceivingContractAccountPDA,
+        // rewardPoolAccount: rewardPoolAccountPDA,
+        // feeReceivingContractAccount: feeReceivingContractAccountPDA,
         tempReportAccount: tempReportAccountPDA,
         txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
         aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
@@ -177,19 +174,19 @@ describe("Initialization", () => {
 
     while (currentSize < maxSize) {
       console.log(
-        `Expanding Oracle Contract State size from ${currentSize} to ${
-          currentSize + 10_240
+        `Expanding Oracle Contract State size from ${currentSize} to ${currentSize + 10_240
         }`
       );
       await program.methods
         .reallocateOracleState()
-        .accounts({
+        .accountsStrict({
           oracleContractState: oracleContractState.publicKey,
           adminPubkey: admin.publicKey,
           tempReportAccount: tempReportAccountPDA,
           contributorDataAccount: contributorDataAccountPDA,
           txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
           aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+          systemProgram: web3.SystemProgram.programId,
         })
         .rpc();
 
@@ -218,7 +215,7 @@ describe("Set Bridge Contract", () => {
   it("Sets the bridge contract address to admin address", async () => {
     await program.methods
       .setBridgeContract(admin.publicKey)
-      .accounts({
+      .accountsPartial({
         oracleContractState: oracleContractState.publicKey,
         adminPubkey: admin.publicKey,
       })
@@ -242,18 +239,18 @@ describe("Set Bridge Contract", () => {
 describe("Contributor Registration", () => {
   it("Registers new data contributors", async () => {
     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
-    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("reward_pool")],
       program.programId
     );
     const [feeReceivingContractAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("fee_receiving_contract")],
         program.programId
       );
 
     const [contributorDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("contributor_data")],
         program.programId
       );
@@ -277,11 +274,12 @@ describe("Contributor Registration", () => {
       // Call the RPC method to register the new data contributor
       await program.methods
         .registerNewDataContributor()
-        .accounts({
+        .accountsPartial({
           contributorDataAccount: contributorDataAccountPDA,
           contributorAccount: contributor.publicKey,
           rewardPoolAccount: rewardPoolAccountPDA,
           feeReceivingContractAccount: feeReceivingContractAccountPDA,
+          systemProgram: SystemProgram.programId,
         })
         .signers([contributor])
         .rpc();
@@ -309,8 +307,7 @@ describe("Contributor Registration", () => {
       );
       assert.isTrue(
         isRegistered,
-        `Contributor ${
-          index + 1
+        `Contributor ${index + 1
         } should be registered in ContributorDataAccount`
       );
     });
@@ -351,7 +348,7 @@ describe("TXID Monitoring", () => {
 
       await program.methods
         .addPendingPayment(txid, expectedAmountStr, "Pending")
-        .accounts({
+        .accountsPartial({
           pendingPaymentAccount: pendingPaymentAccountPDA,
           oracleContractState: oracleContractState.publicKey,
           user: admin.publicKey,
@@ -361,7 +358,7 @@ describe("TXID Monitoring", () => {
 
       await program.methods
         .addTxidForMonitoring({ txid: txid })
-        .accounts({
+        .accountsPartial({
           oracleContractState: oracleContractState.publicKey,
           caller: admin.publicKey,
           pendingPaymentAccount: pendingPaymentAccountPDA,
@@ -431,7 +428,7 @@ describe("TXID Monitoring Verification", () => {
       assert.strictEqual(
         pendingPaymentData.pendingPayment.expectedAmount.toNumber(),
         COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING *
-          web3.LAMPORTS_PER_SOL,
+        web3.LAMPORTS_PER_SOL,
         `The expected amount in PendingPayment should match for TXID: ${txid}`
       );
 
@@ -472,21 +469,21 @@ describe("Data Report Submission", () => {
 
     // Find the PDA for the ContributorDataAccount
     const [contributorDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("contributor_data")],
         program.programId
       );
 
     // Find the PDA for the TxidSubmissionCountsAccount
     const [txidSubmissionCountsAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("txid_submission_counts")],
         program.programId
       );
 
     // Find the PDA for the AggregatedConsensusDataAccount
     const [aggregatedConsensusDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("aggregated_consensus_data")],
         program.programId
       );
@@ -517,7 +514,7 @@ describe("Data Report Submission", () => {
           i < BAD_CONTRIBUTOR_INDEX
             ? 0
             : (i - BAD_CONTRIBUTOR_INDEX + 1) /
-              (contributors.length - BAD_CONTRIBUTOR_INDEX);
+            (contributors.length - BAD_CONTRIBUTOR_INDEX);
         const isIncorrect = Math.random() < errorProbability;
 
         // Randomize the status value for each report
@@ -565,7 +562,7 @@ describe("Data Report Submission", () => {
               randomFileHash,
               contributor.publicKey
             )
-            .accounts({
+            .accountsPartial({
               reportAccount: reportAccountPDA,
               tempReportAccount: tempReportAccountPDA,
               contributorDataAccount: contributorDataAccountPDA,
@@ -584,29 +581,29 @@ describe("Data Report Submission", () => {
           try {
             await provider.sendAndConfirm(transaction, [contributor]);
             console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
-        } catch (error) {
+          } catch (error) {
             const errorString = error.toString();
-        
+
             // Extracting the error code
             const match = errorString.match(/custom program error: 0x(\w+)/);
             if (match) {
-                const errorCode = parseInt(match[1], 16);
-                const errorName = ErrorCodeMap[errorCode];
-        
-                if (errorName === 'ContributorBanned' && i >= BAD_CONTRIBUTOR_INDEX) {
-                    console.log(`Expected 'ContributorBanned' error for contributor ${contributor.publicKey.toBase58()}: ${errorString}`);
-                } else if (errorName === 'EnoughReportsSubmittedForTxid' && i >= MIN_NUMBER_OF_ORACLES) {
-                    console.log(`Expected 'EnoughReportsSubmittedForTxid' error for contributor ${contributor.publicKey.toBase58()}: ${errorString}`);
-                } else {
-                    console.error(`Unexpected error: ${errorName || 'Unknown error'} - ${errorString}`);
-                    // Decide if you want to throw the error or continue
-                }
+              const errorCode = parseInt(match[1], 16);
+              const errorName = ErrorCodeMap[errorCode];
+
+              if (errorName === 'ContributorBanned' && i >= BAD_CONTRIBUTOR_INDEX) {
+                console.log(`Expected 'ContributorBanned' error for contributor ${contributor.publicKey.toBase58()}: ${errorString}`);
+              } else if (errorName === 'EnoughReportsSubmittedForTxid' && i >= MIN_NUMBER_OF_ORACLES) {
+                console.log(`Expected 'EnoughReportsSubmittedForTxid' error for contributor ${contributor.publicKey.toBase58()}: ${errorString}`);
+              } else {
+                console.error(`Unexpected error: ${errorName || 'Unknown error'} - ${errorString}`);
+                // Decide if you want to throw the error or continue
+              }
             } else {
-                console.error(`Error parsing error code: ${errorString}`);
-                // Decide on handling unparsed errors
+              console.error(`Error parsing error code: ${errorString}`);
+              // Decide on handling unparsed errors
             }
-        }
-        
+          }
+
         } catch (error) {
           console.error(
             `Error submitting report for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`,
@@ -660,13 +657,13 @@ describe("Data Report Submission", () => {
 
       // Fetch the consensus data from the AggregatedConsensusDataAccount PDA
       const aggregatedConsensusDataAccount =
-      await program.account.aggregatedConsensusDataAccount.fetch(
+        await program.account.aggregatedConsensusDataAccount.fetch(
           aggregatedConsensusDataAccountPDA
-      );
+        );
       const consensusData = aggregatedConsensusDataAccount.consensusData.find(
-          (data) => data.txid === txid
+        (data) => data.txid === txid
       );
-      
+
       assert(
         consensusData !== undefined,
         `Consensus data should be present for the TXID ${txid}`
@@ -768,7 +765,7 @@ describe("Data Cleanup Verification", () => {
   it("Verifies that data is cleaned up post-consensus", async () => {
     const txidsToCheck = trackedTxids;
 
-    const [tempReportAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    const [tempReportAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("temp_tx_status_report")],
       program.programId
     );
@@ -800,7 +797,7 @@ describe("Payment Processing by Bridge Contract", () => {
     );
     // Derive the FeeReceivingContractAccount PDA
     const [feeReceivingContractAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("fee_receiving_contract")],
         program.programId
       );
@@ -846,7 +843,7 @@ describe("Payment Processing by Bridge Contract", () => {
           txid,
           COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING
         )
-        .accounts({
+        .accountsPartial({
           sourceAccount: admin.publicKey,
           oracleContractState: oracleContractState.publicKey,
           pendingPaymentAccount: pendingPaymentAccountPDA,
@@ -880,7 +877,7 @@ describe("Eligibility for Rewards", () => {
   it("should check if contributors meet reward eligibility criteria", async () => {
     // Fetch the ContributorDataAccount
     const [contributorDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("contributor_data")],
         program.programId
       );
@@ -980,7 +977,7 @@ describe('Reward Distribution for Eligible Contributor', () => {
     try {
       // Request reward for the eligible contributor
       await program.methods.requestReward(eligibleContributor.publicKey)
-        .accounts({
+        .accountsPartial({
           rewardPoolAccount: rewardPoolAccountPDA,
           oracleContractState: oracleContractState.publicKey,
           contributorDataAccount: contributorDataAccountPDA,
@@ -1027,13 +1024,13 @@ describe('Request Reward for Ineligible Contributor', () => {
     const ineligibleContributor = contributors[contributors.length - 1]; // Assuming the last contributor is ineligible
 
     // Find the PDA for the RewardPoolAccount
-    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("reward_pool")],
       program.programId
     );
 
     const [contributorDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
+      web3.PublicKey.findProgramAddressSync(
         [Buffer.from("contributor_data")],
         program.programId
       );
@@ -1041,7 +1038,7 @@ describe('Request Reward for Ineligible Contributor', () => {
     try {
       // Attempt to request reward
       await program.methods.requestReward(ineligibleContributor.publicKey)
-        .accounts({
+        .accountsPartial({
           rewardPoolAccount: rewardPoolAccountPDA,
           oracleContractState: oracleContractState.publicKey,
           contributorDataAccount: contributorDataAccountPDA
@@ -1055,14 +1052,14 @@ describe('Request Reward for Ineligible Contributor', () => {
       // Extracting the error code
       const match = errorString.match(/custom program error: 0x(\w+)/);
       if (match) {
-          const errorCode = parseInt(match[1], 16);
-          const errorName = ErrorCodeMap[errorCode];
+        const errorCode = parseInt(match[1], 16);
+        const errorName = ErrorCodeMap[errorCode];
 
-          // Check for the specific error thrown by your program
-          assert.equal(errorName, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
+        // Check for the specific error thrown by your program
+        assert.equal(errorName, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
       } else {
-          console.error(`Error parsing error code: ${errorString}`);
-          // Decide on handling unparsed errors
+        console.error(`Error parsing error code: ${errorString}`);
+        // Decide on handling unparsed errors
       }
     }
   });
