@@ -1,5 +1,6 @@
 import * as anchor from '@coral-xyz/anchor';
-import { SolanaPastelOracleProgram, IDL } from './target/types/solana_pastel_oracle_program';
+import { SolanaPastelOracleProgram } from './target/types/solana_pastel_oracle_program';
+import IDL from './target/idl/solana_pastel_oracle_program.json';
 import { web3 } from '@coral-xyz/anchor';
 
 async function main() {
@@ -11,8 +12,7 @@ async function main() {
     const provider = new anchor.AnchorProvider(connection, wallet, { preflightCommitment: "processed" });
     anchor.setProvider(provider);
 
-    const programID = new anchor.web3.PublicKey("AfP1c4sFcY1FeiGjQEtyxCim8BRnw22okNbKAsH2sBsB");
-    const program = new anchor.Program<SolanaPastelOracleProgram>(IDL, programID, provider);
+    const program = new anchor.Program<SolanaPastelOracleProgram>(IDL as any, provider);
 
     // Keypairs for necessary accounts
     const admin = web3.Keypair.generate();
@@ -23,7 +23,7 @@ async function main() {
 
     // Initialize the Oracle Contract State
     await program.methods.initialize(admin.publicKey)
-        .accounts({
+        .accountsStrict({
             oracleContractState: oracleContractState.publicKey,
             user: admin.publicKey,
             rewardPoolAccount: rewardPoolAccount.publicKey,
@@ -35,7 +35,7 @@ async function main() {
 
     // Register a new contributor
     await program.methods.registerNewDataContributor()
-        .accounts({
+        .accountsStrict({
             oracleContractState: oracleContractState.publicKey,
             contributorAccount: newContributor.publicKey,
             rewardPoolAccount: rewardPoolAccount.publicKey,
