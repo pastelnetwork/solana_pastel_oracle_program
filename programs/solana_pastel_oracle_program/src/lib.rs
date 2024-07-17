@@ -5,9 +5,9 @@ pub mod helper;
 pub mod instructions;
 pub mod state;
 
-use crate::enumeration::{PastelTicketType, PaymentStatus, TxidStatus};
+use crate::enumeration::*;
 use crate::instructions::*;
-use crate::state::{PastelTxStatusReport, PendingPayment};
+use crate::state::*;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 
