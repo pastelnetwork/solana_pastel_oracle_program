@@ -14,10 +14,10 @@ const PERMANENT_BAN_THRESHOLD: u32 = 100; // Number of non-consensus report subm
 const CONTRIBUTIONS_FOR_PERMANENT_BAN: u32 = 250; // Considered for permanent ban after 250 contributions
 const TEMPORARY_BAN_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
 const CONTRIBUTIONS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 contributions
-const TEMPORARY_BAN_DURATION: u64 = 24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
-const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS: u64 = 10 * 60; // Maximum duration in seconds from last report submission for a given TXID before computing consensus (e.g., 10 minutes)
-const DATA_RETENTION_PERIOD: u64 = 24 * 60 * 60; // How long to keep data in the contract state (1 day)
-const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 24 * 60 * 60; // Number of seconds to retain submission counts (i.e., 24 hours)
+const TEMPORARY_BAN_DURATION: u32 = 24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
+const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS: u32 = 10 * 60; // Maximum duration in seconds from last report submission for a given TXID before computing consensus (e.g., 10 minutes)
+const DATA_RETENTION_PERIOD: u32 = 24 * 60 * 60; // How long to keep data in the contract state (1 day)
+const SUBMISSION_COUNT_RETENTION_PERIOD: u32 = 24 * 60 * 60; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
 
@@ -81,7 +81,7 @@ pub struct PastelTxStatusReport {
     pub txid_status: TxidStatus,
     pub pastel_ticket_type: Option<PastelTicketType>,
     pub first_6_characters_of_sha3_256_hash_of_corresponding_file: Option<String>,
-    pub timestamp: u64,
+    pub timestamp: u32,
     pub contributor_reward_address: Pubkey,
 }
 
@@ -96,7 +96,7 @@ pub struct CommonReportData {
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct SpecificReportData {
     pub contributor_reward_address: Pubkey,
-    pub timestamp: u64,
+    pub timestamp: u32,
     pub common_data_ref: u64, // Reference to CommonReportData
 }
 
@@ -117,7 +117,7 @@ pub struct TempTxStatusReportAccount {
 pub struct TxidSubmissionCount {
     pub txid: String,
     pub count: u32,
-    pub last_updated: u64,
+    pub last_updated: u32,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
@@ -176,7 +176,7 @@ fn update_submission_count(
     txid: &str,
 ) -> Result<()> {
     // Get the current timestamp
-    let current_timestamp_u64 = Clock::get()?.unix_timestamp as u64;
+    let current_timestamp = Clock::get()?.unix_timestamp as u32;
 
     // Check if the txid already exists in the submission counts
     if let Some(count) = txid_submission_counts_account
@@ -186,7 +186,7 @@ fn update_submission_count(
     {
         // Update the existing count
         count.count += 1;
-        count.last_updated = current_timestamp_u64;
+        count.last_updated = current_timestamp;
     } else {
         // Insert a new count if the txid does not exist
         txid_submission_counts_account
@@ -194,7 +194,7 @@ fn update_submission_count(
             .push(TxidSubmissionCount {
                 txid: txid.to_string(),
                 count: 1,
-                last_updated: current_timestamp_u64,
+                last_updated: current_timestamp,
             });
     }
 
@@ -246,7 +246,7 @@ fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, 
     (consensus_status, consensus_hash)
 }
 
-fn apply_bans(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
+fn apply_bans(contributor: &mut Contributor, current_timestamp: u32, is_accurate: bool) {
     if !is_accurate {
         if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN
             && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0
@@ -257,14 +257,14 @@ fn apply_bans(contributor: &mut Contributor, current_timestamp: u64, is_accurate
         } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN
             && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD
         {
-            contributor.ban_expiry = u64::MAX;
+            contributor.ban_expiry = u32::MAX;
             msg!("Contributor: {} is permanently banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Removing from list of contributors!", 
             contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, PERMANENT_BAN_THRESHOLD);
         }
     }
 }
 
-fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
+fn update_scores(contributor: &mut Contributor, current_timestamp: u32, is_accurate: bool) {
     let time_diff = current_timestamp.saturating_sub(contributor.last_active_timestamp);
     let hours_inactive: f32 = time_diff as f32 / 3_600.0;
 
@@ -333,7 +333,7 @@ fn log_score_updates(contributor: &Contributor) {
     );
 }
 
-fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
+fn update_statuses(contributor: &mut Contributor, current_timestamp: u32) {
     // Updating recently active status
     let recent_activity_threshold = 86_400; // 24 hours in seconds
     contributor.is_recently_active =
@@ -355,7 +355,7 @@ fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
         && contributor.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
 }
 
-fn update_contributor(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
+fn update_contributor(contributor: &mut Contributor, current_timestamp: u32, is_accurate: bool) {
     // Check if the contributor is banned before proceeding. If so, just return.
     if contributor.calculate_is_banned(current_timestamp) {
         msg!(
@@ -381,7 +381,7 @@ fn calculate_consensus(
     contributor_data_account: &mut Account<ContributorDataAccount>,
     txid: &str,
 ) -> Result<()> {
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    let current_timestamp = Clock::get()?.unix_timestamp as u32;
     let (consensus_status, consensus_hash) = get_aggregated_data(aggregated_data_account, txid)
         .map(|data| compute_consensus(data))
         .unwrap_or((TxidStatus::Invalid, String::new()));
@@ -422,7 +422,7 @@ pub fn apply_permanent_bans(contributor_data_account: &mut Account<ContributorDa
     let contributors_to_remove: Vec<String> = contributor_data_account
         .contributors
         .iter()
-        .filter(|c| c.ban_expiry == u64::MAX)
+        .filter(|c| c.ban_expiry == u32::MAX)
         .map(|c| c.reward_address.to_string()) // Convert Pubkey to String
         .collect();
 
@@ -433,7 +433,7 @@ pub fn apply_permanent_bans(contributor_data_account: &mut Account<ContributorDa
     // Retain only contributors who are not permanently banned
     contributor_data_account
         .contributors
-        .retain(|c| c.ban_expiry != u64::MAX);
+        .retain(|c| c.ban_expiry != u32::MAX);
 }
 
 fn post_consensus_tasks(
@@ -443,7 +443,7 @@ fn post_consensus_tasks(
     contributor_data_account: &mut Account<ContributorDataAccount>,
     txid: &str,
 ) -> Result<()> {
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    let current_timestamp = Clock::get()?.unix_timestamp as u32;
 
     apply_permanent_bans(contributor_data_account);
 
@@ -480,7 +480,7 @@ fn aggregate_consensus_data(
     txid: &str,
 ) -> Result<()> {
     let scaled_weight = (weight * 100.0) as i32; // Scaling by a factor of 100
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    let current_timestamp = Clock::get()?.unix_timestamp as u32;
 
     // Check if the txid already exists in the aggregated consensus data
     if let Some(data_entry) = aggregated_data_account
@@ -579,7 +579,7 @@ pub fn submit_data_report_helper(
         .find(|c| c.reward_address == contributor_reward_address)
         .ok_or(OracleError::ContributorNotRegistered)?;
 
-    if contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64) {
+    if contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u32) {
         return Err(OracleError::ContributorBanned.into());
     }
 
@@ -738,13 +738,13 @@ pub struct Contributor {
     pub reward_address: Pubkey,
     pub registration_entrance_fee_transaction_signature: String,
     pub compliance_score: f32,
-    pub last_active_timestamp: u64,
+    pub last_active_timestamp: u32,
     pub total_reports_submitted: u32,
     pub accurate_reports_count: u32,
     pub current_streak: u32,
     pub reliability_score: f32,
     pub consensus_failures: u32,
-    pub ban_expiry: u64,
+    pub ban_expiry: u32,
     pub is_eligible_for_rewards: bool,
     pub is_recently_active: bool,
     pub is_reliable: bool,
@@ -1041,7 +1041,7 @@ pub struct AggregatedConsensusData {
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
     pub hash_weights: Vec<HashWeight>,
     pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
-    pub last_updated: u64, // Unix timestamp indicating the last update time
+    pub last_updated: u32, // Unix timestamp indicating the last update time
 }
 
 #[derive(Accounts)]
@@ -1074,7 +1074,7 @@ pub fn request_reward_helper(
         .find(|c| c.reward_address == contributor_address)
         .ok_or(OracleError::UnregisteredOracle)?;
 
-    let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+    let current_unix_timestamp = Clock::get()?.unix_timestamp as u32;
 
     if !contributor.is_eligible_for_rewards {
         msg!(
@@ -1185,7 +1185,7 @@ pub fn register_new_data_contributor_helper(
         REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS as u64,
     )?;
 
-    let last_active_timestamp = Clock::get()?.unix_timestamp as u64;
+    let last_active_timestamp = Clock::get()?.unix_timestamp as u32;
 
     // Create and add the new contributor
     let new_contributor = Contributor {
@@ -1300,7 +1300,7 @@ pub fn should_calculate_consensus(
     let min_threshold_met = submission_count >= MIN_NUMBER_OF_ORACLES as u32;
 
     // Get the current unix timestamp from the Solana clock
-    let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+    let current_unix_timestamp = Clock::get()?.unix_timestamp as u32;
 
     // Check if N minutes have elapsed since the last update
     let max_waiting_period_elapsed_for_txid = current_unix_timestamp - last_updated
@@ -1313,7 +1313,7 @@ pub fn should_calculate_consensus(
 }
 
 pub fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<()> {
-    let current_time = Clock::get()?.unix_timestamp as u64;
+    let current_time = Clock::get()?.unix_timestamp as u32;
     state
         .txid_submission_counts
         .retain(|count| current_time - count.last_updated < SUBMISSION_COUNT_RETENTION_PERIOD);
@@ -1366,7 +1366,7 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
 
 impl Contributor {
     // Check if the contributor is currently banned
-    pub fn calculate_is_banned(&self, current_time: u64) -> bool {
+    pub fn calculate_is_banned(&self, current_time: u32) -> bool {
         current_time < self.ban_expiry
     }
 
@@ -1596,7 +1596,7 @@ pub mod solana_pastel_oracle_program {
         msg!("In `submit_data_report` function -- Params: txid={}, txid_status={:?}, pastel_ticket_type={:?}, first_6_chars_hash={}, contributor_addr={}",
             txid, txid_status, pastel_ticket_type, first_6_characters_hash, contributor_reward_address);
 
-        let timestamp = Clock::get()?.unix_timestamp as u64;
+        let timestamp = Clock::get()?.unix_timestamp as u32;
 
         let report = PastelTxStatusReport {
             txid: txid.clone(),
