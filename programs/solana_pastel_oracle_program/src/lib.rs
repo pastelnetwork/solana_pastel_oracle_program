@@ -1,6 +1,4 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::account_info::AccountInfo;
-use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::hash::{hash, Hash};
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::system_program::{transfer, Transfer};
@@ -554,7 +552,7 @@ pub fn submit_data_report_helper(
     txid: String,
     report: PastelTxStatusReport,
     contributor_reward_address: Pubkey,
-) -> ProgramResult {
+) -> Result<()> {
     // Directly access accounts from the context
     let txid_submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount> =
         &mut ctx.accounts.txid_submission_counts_account;
@@ -713,7 +711,7 @@ pub fn add_pending_payment_helper(
     ctx: Context<HandlePendingPayment>,
     txid: String,
     pending_payment: PendingPayment,
-) -> ProgramResult {
+) -> Result<()> {
     let pending_payment_account = &mut ctx.accounts.pending_payment_account;
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
@@ -1063,7 +1061,7 @@ pub struct RequestReward<'info> {
     pub contributor_data_account: Account<'info, ContributorDataAccount>,
     /// CHECK: This is the account we're transferring lamports to
     #[account(mut)]
-    pub contributor: AccountInfo<'info>,
+    pub contributor: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1130,8 +1128,8 @@ pub fn request_reward_helper(
 #[derive(Accounts)]
 pub struct RegisterNewDataContributor<'info> {
     /// CHECK: Manual checks are performed in the instruction to ensure the contributor_account is valid and safe to use.
-    #[account(mut, signer)]
-    pub contributor_account: AccountInfo<'info>,
+    #[account(mut)]
+    pub contributor_account: Signer<'info>,
 
     /// CHECK: OK
     #[account(mut, seeds = [b"reward_pool"], bump)]
@@ -1235,8 +1233,7 @@ pub struct AddTxidForMonitoring<'info> {
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
     /// CHECK: The caller is manually verified in the instruction logic to ensure it's the correct and authorized account.
-    #[account(signer)]
-    pub caller: AccountInfo<'info>,
+    pub caller: Signer<'info>,
 
     // The `pending_payment_account` will be initialized in the function
     #[account(mut)]
@@ -1288,8 +1285,8 @@ pub struct ProcessPastelTxStatusReport<'info> {
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
     /// CHECK: Manual checks are performed in the instruction to ensure the contributor is valid and authorized. This includes verifying signatures and other relevant validations.
-    #[account(mut, signer)]
-    pub contributor: AccountInfo<'info>,
+    #[account(mut)]
+    pub contributor: Signer<'info>,
     // You can add other accounts as needed
 }
 
@@ -1413,8 +1410,7 @@ impl<'info> SetBridgeContract<'info> {
 #[instruction(txid: String)] // Include txid as part of the instruction
 pub struct ProcessPayment<'info> {
     /// CHECK: This is checked in the handler function to verify it's the bridge contract.
-    #[account(signer)]
-    pub source_account: AccountInfo<'info>,
+    pub source_account: Signer<'info>,
 
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
@@ -1462,7 +1458,8 @@ pub struct WithdrawFunds<'info> {
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
     /// CHECK: The admin_account is manually verified in the instruction to ensure it's the correct and authorized account for withdrawal operations. This includes checking if the account matches the admin_pubkey stored in oracle_contract_state.
-    pub admin_account: AccountInfo<'info>,
+    #[account(mut)]
+    pub admin_account: Signer<'info>,
 
     /// CHECK: OK
     #[account(mut, seeds = [b"reward_pool"], bump)]
@@ -1480,15 +1477,14 @@ impl<'info> WithdrawFunds<'info> {
         reward_pool_amount: u64,
         fee_receiving_amount: u64,
     ) -> Result<()> {
-        if !ctx.accounts.admin_account.is_signer {
-            return Err(OracleError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account is a signer
+        if ctx.accounts.oracle_contract_state.admin_pubkey == ctx.accounts.admin_account.key() {
+            return Err(OracleError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account matches admin_pubkey stored in oracle_contract_state
         }
-        let admin_account = &mut ctx.accounts.admin_account;
         let reward_pool_account = &mut ctx.accounts.reward_pool_account;
         let fee_receiving_contract_account = &mut ctx.accounts.fee_receiving_contract_account;
 
         // Transfer SOL from the reward pool account to the admin account
-        if **reward_pool_account.to_account_info().lamports.borrow() < reward_pool_amount {
+        if reward_pool_account.lamports() < reward_pool_amount {
             return Err(OracleError::InsufficientFunds.into());
         }
         transfer(
@@ -1496,7 +1492,7 @@ impl<'info> WithdrawFunds<'info> {
                 ctx.accounts.system_program.to_account_info(),
                 Transfer {
                     from: ctx.accounts.reward_pool_account.to_account_info(),
-                    to: admin_account.to_account_info(),
+                    to: ctx.accounts.admin_account.to_account_info(),
                 },
             )
             .with_signer(&[&[b"reward_pool", &[ctx.bumps.reward_pool_account]]]),
@@ -1504,12 +1500,7 @@ impl<'info> WithdrawFunds<'info> {
         )?;
 
         // Transfer SOL from the fee receiving contract account to the admin account
-        if **fee_receiving_contract_account
-            .to_account_info()
-            .lamports
-            .borrow()
-            < fee_receiving_amount
-        {
+        if fee_receiving_contract_account.lamports() < fee_receiving_amount {
             return Err(OracleError::InsufficientFunds.into());
         }
         transfer(
@@ -1517,7 +1508,7 @@ impl<'info> WithdrawFunds<'info> {
                 ctx.accounts.system_program.to_account_info(),
                 Transfer {
                     from: fee_receiving_contract_account.to_account_info(),
-                    to: admin_account.to_account_info(),
+                    to: ctx.accounts.admin_account.to_account_info(),
                 },
             )
             .with_signer(&[&[
@@ -1584,20 +1575,9 @@ pub mod solana_pastel_oracle_program {
     pub fn add_pending_payment(
         ctx: Context<HandlePendingPayment>,
         txid: String,
-        expected_amount_str: String,
-        payment_status_str: String,
+        expected_amount: u64,
+        payment_status: PaymentStatus,
     ) -> Result<()> {
-        let expected_amount = expected_amount_str
-            .parse::<u64>()
-            .map_err(|_| OracleError::PendingPaymentInvalidAmount)?;
-
-        // Convert the payment status from string to enum
-        let payment_status = match payment_status_str.as_str() {
-            "Pending" => PaymentStatus::Pending,
-            "Received" => PaymentStatus::Received,
-            _ => return Err(OracleError::InvalidPaymentStatus.into()),
-        };
-
         let pending_payment = PendingPayment {
             txid: txid.clone(),
             expected_amount,
@@ -1614,30 +1594,13 @@ pub mod solana_pastel_oracle_program {
     pub fn submit_data_report(
         ctx: Context<SubmitDataReport>,
         txid: String,
-        txid_status_str: String,
-        pastel_ticket_type_str: String,
+        txid_status: TxidStatus,
+        pastel_ticket_type: PastelTicketType,
         first_6_characters_hash: String,
         contributor_reward_address: Pubkey,
-    ) -> ProgramResult {
-        msg!("In `submit_data_report` function -- Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, contributor_addr={}",
-            txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, contributor_reward_address);
-
-        // Conversion logic remains the same
-        let txid_status = match txid_status_str.as_str() {
-            "Invalid" => TxidStatus::Invalid,
-            "PendingMining" => TxidStatus::PendingMining,
-            "MinedPendingActivation" => TxidStatus::MinedPendingActivation,
-            "MinedActivated" => TxidStatus::MinedActivated,
-            _ => return Err(ProgramError::from(OracleError::InvalidTxidStatus)),
-        };
-
-        let pastel_ticket_type = match pastel_ticket_type_str.as_str() {
-            "Sense" => PastelTicketType::Sense,
-            "Cascade" => PastelTicketType::Cascade,
-            "Nft" => PastelTicketType::Nft,
-            "InferenceApi" => PastelTicketType::InferenceApi,
-            _ => return Err(ProgramError::from(OracleError::InvalidPastelTicketType)),
-        };
+    ) -> Result<()> {
+        msg!("In `submit_data_report` function -- Params: txid={}, txid_status={:?}, pastel_ticket_type={:?}, first_6_chars_hash={}, contributor_addr={}",
+            txid, txid_status, pastel_ticket_type, first_6_characters_hash, contributor_reward_address);
 
         let timestamp = Clock::get()?.unix_timestamp as u64;
 

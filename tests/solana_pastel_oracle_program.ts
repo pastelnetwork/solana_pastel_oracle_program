@@ -63,17 +63,17 @@ const ErrorCodeMap = {
 };
 
 const TxidStatusEnum = {
-  Invalid: "Invalid",
-  PendingMining: "PendingMining",
-  MinedPendingActivation: "MinedPendingActivation",
-  MinedActivated: "MinedActivated",
+  Invalid: "invalid",
+  PendingMining: "pendingMining",
+  MinedPendingActivation: "minedPendingActivation",
+  MinedActivated: "minedActivated",
 };
 
 const PastelTicketTypeEnum = {
-  Sense: "Sense",
-  Cascade: "Cascade",
-  Nft: "Nft",
-  InferenceApi: "InferenceApi",
+  Sense: "sense",
+  Cascade: "cascade",
+  Nft: "nft",
+  InferenceApi: "inferenceApi",
 };
 
 console.log("Program ID:", program.programId.toString());
@@ -347,7 +347,7 @@ describe("TXID Monitoring", () => {
       );
 
       await program.methods
-        .addPendingPayment(txid, expectedAmountStr, "Pending")
+        .addPendingPayment(txid, new BN(expectedAmountStr), { pending: {} })
         .accountsPartial({
           pendingPaymentAccount: pendingPaymentAccountPDA,
           oracleContractState: oracleContractState.publicKey,
@@ -557,8 +557,8 @@ describe("Data Report Submission", () => {
           const submitDataReportInstruction = await program.methods
             .submitDataReport(
               txid,
-              txidStatusValue,
-              pastelTicketTypeValue,
+              { [txidStatusValue.toString()]: {} } as unknown as any, // TODO: better typing
+              { [pastelTicketTypeValue.toString()]: {} } as unknown as any, // TODO: better typing
               randomFileHash,
               contributor.publicKey
             )
