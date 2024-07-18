@@ -47,12 +47,6 @@ pub enum OracleError {
     EnoughReportsSubmittedForTxid,
 }
 
-impl From<OracleError> for ProgramError {
-    fn from(e: OracleError) -> Self {
-        ProgramError::Custom(e as u32)
-    }
-}
-
 pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> Hash {
     // Concatenate the string representations. Reward address is Base58-encoded by default.
     let preimage_string = format!("{}{}{}", seed_preamble, txid, reward_address);
