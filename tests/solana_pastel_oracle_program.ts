@@ -37,31 +37,6 @@ const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
 const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
 
-const ErrorCodeMap = {
-  0x0: 'ContributorAlreadyRegistered',
-  0x1: 'UnregisteredOracle',
-  0x2: 'InvalidTxid',
-  0x3: 'InvalidFileHashLength',
-  0x4: 'MissingPastelTicketType',
-  0x5: 'MissingFileHash',
-  0x6: 'RegistrationFeeNotPaid',
-  0x7: 'NotEligibleForReward',
-  0x8: 'NotBridgeContractAddress',
-  0x9: 'InsufficientFunds',
-  0xa: 'UnauthorizedWithdrawalAccount',
-  0xb: 'InvalidPaymentAmount',
-  0xc: 'PaymentNotFound',
-  0xd: 'PendingPaymentAlreadyInitialized',
-  0xe: 'AccountAlreadyInitialized',
-  0xf: 'PendingPaymentInvalidAmount',
-  0x10: 'InvalidPaymentStatus',
-  0x11: 'InvalidTxidStatus',
-  0x12: 'InvalidPastelTicketType',
-  0x13: 'ContributorNotRegistered',
-  0x14: 'ContributorBanned',
-  0x15: 'EnoughReportsSubmittedForTxid'
-};
-
 const TxidStatusEnum = {
   Invalid: "invalid",
   PendingMining: "pendingMining",
@@ -582,28 +557,20 @@ describe("Data Report Submission", () => {
             await provider.sendAndConfirm(transaction, [contributor]);
             console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
           } catch (error) {
-            const errorString = error.toString();
-
-            // Extracting the error code
-            const match = errorString.match(/custom program error: 0x(\w+)/);
-            if (match) {
-              const errorCode = parseInt(match[1], 16);
-              const errorName = ErrorCodeMap[errorCode];
-
-              if (errorName === 'ContributorBanned' && i >= BAD_CONTRIBUTOR_INDEX) {
-                console.log(`Expected 'ContributorBanned' error for contributor ${contributor.publicKey.toBase58()}: ${errorString}`);
-              } else if (errorName === 'EnoughReportsSubmittedForTxid' && i >= MIN_NUMBER_OF_ORACLES) {
-                console.log(`Expected 'EnoughReportsSubmittedForTxid' error for contributor ${contributor.publicKey.toBase58()}: ${errorString}`);
+            const anchorError = anchor.AnchorError.parse(error.logs);
+            if (anchorError) {
+              if (anchorError.error.errorCode.code === 'ContributorBanned' && i >= BAD_CONTRIBUTOR_INDEX) {
+                console.log(`Expected 'ContributorBanned' error for contributor ${contributor.publicKey.toBase58()}: ${anchorError.error.errorMessage}`);
+              } else if (anchorError.error.errorCode.code === 'EnoughReportsSubmittedForTxid' && i >= MIN_NUMBER_OF_ORACLES) {
+                console.log(`Expected 'EnoughReportsSubmittedForTxid' error for contributor ${contributor.publicKey.toBase58()}: ${anchorError.error.errorMessage}`);
               } else {
-                console.error(`Unexpected error: ${errorName || 'Unknown error'} - ${errorString}`);
+                console.error(`Unexpected error: ${anchorError.error.errorCode.code || 'Unknown error'} - ${anchorError.error.errorMessage}`);
                 // Decide if you want to throw the error or continue
               }
             } else {
-              console.error(`Error parsing error code: ${errorString}`);
-              // Decide on handling unparsed errors
+              console.error(`Error parsing error code: ${error.toString()}`);
             }
           }
-
         } catch (error) {
           console.error(
             `Error submitting report for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`,
@@ -1047,18 +1014,11 @@ describe('Request Reward for Ineligible Contributor', () => {
 
       throw new Error('Reward request should have failed for ineligible contributor');
     } catch (error) {
-      const errorString = error.toString();
-
-      // Extracting the error code
-      const match = errorString.match(/custom program error: 0x(\w+)/);
-      if (match) {
-        const errorCode = parseInt(match[1], 16);
-        const errorName = ErrorCodeMap[errorCode];
-
-        // Check for the specific error thrown by your program
-        assert.equal(errorName, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
+      const anchorError = anchor.AnchorError.parse(error.logs);
+      if (anchorError) {
+        assert.equal(anchorError.error.errorCode.code, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
       } else {
-        console.error(`Error parsing error code: ${errorString}`);
+        console.error(`Error parsing error code: ${error.toString()}`);
         // Decide on handling unparsed errors
       }
     }
