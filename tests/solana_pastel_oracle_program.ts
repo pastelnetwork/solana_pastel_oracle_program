@@ -9,6 +9,7 @@ import * as crypto from "crypto";
 import { SystemProgram } from "@solana/web3.js";
 const { ComputeBudgetProgram, Transaction, PublicKey } = anchor.web3;
 
+const TURN_ON_STORAGE_AND_COMPUTE_PROFILING = true;  // Set this flag to true to enable profiling
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 process.env.RUST_LOG =
   "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
@@ -51,8 +52,37 @@ const PastelTicketTypeEnum = {
   InferenceApi: "inferenceApi",
 };
 
+let totalComputeUnitsUsed = 0;
+let maxAccountStorageUsed = 0;
+
 console.log("Program ID:", program.programId.toString());
 console.log("Admin ID:", admin.publicKey.toString());
+
+const measureComputeUnitsAndStorage = async (txSignature: string) => {
+  if (!TURN_ON_STORAGE_AND_COMPUTE_PROFILING) return;
+
+  // Retry logic to handle cases where the transaction might not be immediately available
+  for (let attempts = 0; attempts < 5; attempts++) {
+    const txDetails = await provider.connection.getParsedTransaction(txSignature, { commitment: 'confirmed' });
+    if (txDetails) {
+      if (txDetails.meta && txDetails.meta.computeUnitsConsumed) {
+        totalComputeUnitsUsed += txDetails.meta.computeUnitsConsumed;
+      }
+
+      const accounts = txDetails.transaction.message.accountKeys.map(key => new web3.PublicKey(key.pubkey));
+      for (const account of accounts) {
+        const accountInfo = await provider.connection.getAccountInfo(account);
+        if (accountInfo && accountInfo.data.length > maxAccountStorageUsed) {
+          maxAccountStorageUsed = accountInfo.data.length;
+        }
+      }
+      return; // Exit if transaction details are successfully processed
+    }
+    // Wait a bit before retrying
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  console.error(`Failed to fetch transaction details for signature: ${txSignature}`);
+};
 
 describe("Initialization", () => {
   it("Initializes and expands the oracle contract state", async () => {
@@ -112,17 +142,17 @@ describe("Initialization", () => {
       })
     );
     await provider.sendAndConfirm(fundTx);
-
+    const fundTxSignature = await provider.sendAndConfirm(fundTx);
+    await measureComputeUnitsAndStorage(fundTxSignature);
+    
     // Initial Initialization
     console.log("Initializing Oracle Contract State");
-    await program.methods
+    const initTxSignature = await program.methods
       .initialize()
       .accountsStrict({
         oracleContractState: oracleContractState.publicKey,
         contributorDataAccount: contributorDataAccountPDA,
         user: admin.publicKey,
-        // rewardPoolAccount: rewardPoolAccountPDA,
-        // feeReceivingContractAccount: feeReceivingContractAccountPDA,
         tempReportAccount: tempReportAccountPDA,
         txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
         aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
@@ -130,6 +160,7 @@ describe("Initialization", () => {
       })
       .signers([oracleContractState])
       .rpc();
+    await measureComputeUnitsAndStorage(initTxSignature);
 
     let state = await program.account.oracleContractState.fetch(
       oracleContractState.publicKey
@@ -152,7 +183,7 @@ describe("Initialization", () => {
         `Expanding Oracle Contract State size from ${currentSize} to ${currentSize + 10_240
         }`
       );
-      await program.methods
+      const reallocateTxSignature = await program.methods
         .reallocateOracleState()
         .accountsStrict({
           oracleContractState: oracleContractState.publicKey,
@@ -164,6 +195,7 @@ describe("Initialization", () => {
           systemProgram: web3.SystemProgram.programId,
         })
         .rpc();
+      await measureComputeUnitsAndStorage(reallocateTxSignature);
 
       currentSize += 10_240;
       state = await program.account.oracleContractState.fetch(
@@ -188,13 +220,14 @@ describe("Initialization", () => {
 
 describe("Set Bridge Contract", () => {
   it("Sets the bridge contract address to admin address", async () => {
-    await program.methods
+    const setBridgeTxSignature = await program.methods
       .setBridgeContract(admin.publicKey)
       .accountsPartial({
         oracleContractState: oracleContractState.publicKey,
         adminPubkey: admin.publicKey,
       })
       .rpc();
+    await measureComputeUnitsAndStorage(setBridgeTxSignature);
 
     // Fetch the updated state to verify the bridge contract address
     const state = await program.account.oracleContractState.fetch(
@@ -244,10 +277,11 @@ describe("Contributor Registration", () => {
       );
 
       // Sign and send the transaction
-      await provider.sendAndConfirm(transaction);
+      const transferTxSignature = await provider.sendAndConfirm(transaction);
+      await measureComputeUnitsAndStorage(transferTxSignature);
 
       // Call the RPC method to register the new data contributor
-      await program.methods
+      const registerTxSignature = await program.methods
         .registerNewDataContributor()
         .accountsPartial({
           contributorDataAccount: contributorDataAccountPDA,
@@ -258,6 +292,7 @@ describe("Contributor Registration", () => {
         })
         .signers([contributor])
         .rpc();
+      await measureComputeUnitsAndStorage(registerTxSignature);
 
       console.log(
         `Contributor ${i + 1} registered successfully with the address:`,
@@ -321,7 +356,7 @@ describe("TXID Monitoring", () => {
         program.programId
       );
 
-      await program.methods
+      const addPendingPaymentTxSignature = await program.methods
         .addPendingPayment(txid, new BN(expectedAmountStr), { pending: {} })
         .accountsPartial({
           pendingPaymentAccount: pendingPaymentAccountPDA,
@@ -330,8 +365,9 @@ describe("TXID Monitoring", () => {
           systemProgram: web3.SystemProgram.programId,
         })
         .rpc();
+      await measureComputeUnitsAndStorage(addPendingPaymentTxSignature);
 
-      await program.methods
+      const addTxidTxSignature = await program.methods
         .addTxidForMonitoring({ txid: txid })
         .accountsPartial({
           oracleContractState: oracleContractState.publicKey,
@@ -341,6 +377,7 @@ describe("TXID Monitoring", () => {
           systemProgram: web3.SystemProgram.programId,
         })
         .rpc();
+      await measureComputeUnitsAndStorage(addTxidTxSignature);
 
       // Fetch the updated state
       const state = await program.account.oracleContractState.fetch(
@@ -554,7 +591,8 @@ describe("Data Report Submission", () => {
 
           // Attempt to submit the data report
           try {
-            await provider.sendAndConfirm(transaction, [contributor]);
+            const submitTxSignature = await provider.sendAndConfirm(transaction, [contributor]);
+            await measureComputeUnitsAndStorage(submitTxSignature);            
             console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
           } catch (error) {
             const anchorError = anchor.AnchorError.parse(error.logs);
@@ -786,7 +824,8 @@ describe("Payment Processing by Bridge Contract", () => {
         })
       );
 
-      await provider.sendAndConfirm(transferTransaction);
+      const transferTxSignature = await provider.sendAndConfirm(transferTransaction);
+      await measureComputeUnitsAndStorage(transferTxSignature);
       console.log(
         `Transferred payment for TXID ${txid} to fee-receiving contract`
       );
@@ -943,7 +982,7 @@ describe('Reward Distribution for Eligible Contributor', () => {
 
     try {
       // Request reward for the eligible contributor
-      await program.methods.requestReward(eligibleContributor.publicKey)
+      const requestRewardTxSignature = await program.methods.requestReward(eligibleContributor.publicKey)
         .accountsPartial({
           rewardPoolAccount: rewardPoolAccountPDA,
           oracleContractState: oracleContractState.publicKey,
@@ -952,6 +991,7 @@ describe('Reward Distribution for Eligible Contributor', () => {
           systemProgram: web3.SystemProgram.programId,
         })
         .rpc();
+      await measureComputeUnitsAndStorage(requestRewardTxSignature);
 
       console.log("Reward request successful");
     } catch (error) {
@@ -1002,29 +1042,36 @@ describe('Request Reward for Ineligible Contributor', () => {
         program.programId
       );
 
-    try {
-      // Attempt to request reward
-      await program.methods.requestReward(ineligibleContributor.publicKey)
-        .accountsPartial({
-          rewardPoolAccount: rewardPoolAccountPDA,
-          oracleContractState: oracleContractState.publicKey,
-          contributorDataAccount: contributorDataAccountPDA
-        })
-        .rpc();
-
-      throw new Error('Reward request should have failed for ineligible contributor');
-    } catch (error) {
-      const anchorError = anchor.AnchorError.parse(error.logs);
-      if (anchorError) {
-        assert.equal(anchorError.error.errorCode.code, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
-      } else {
-        console.error(`Error parsing error code: ${error.toString()}`);
-        // Decide on handling unparsed errors
+      try {
+        // Attempt to request reward
+        const requestRewardTxSignature = await program.methods.requestReward(ineligibleContributor.publicKey)
+          .accountsPartial({
+            rewardPoolAccount: rewardPoolAccountPDA,
+            oracleContractState: oracleContractState.publicKey,
+            contributorDataAccount: contributorDataAccountPDA
+          })
+          .rpc();
+        await measureComputeUnitsAndStorage(requestRewardTxSignature);
+  
+        throw new Error('Reward request should have failed for ineligible contributor');
+      } catch (error) {
+        const anchorError = anchor.AnchorError.parse(error.logs);
+        if (anchorError) {
+          assert.equal(anchorError.error.errorCode.code, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
+        } else {
+          console.error(`Error parsing error code: ${error.toString()}`);
+          // Decide on handling unparsed errors
+        }
       }
-    }
+    });
   });
-});
+  
 
+  // After all tests
+after(async function () {
+  console.log(`Total compute units used: ${totalComputeUnitsUsed}`);
+  console.log(`Max account storage used: ${maxAccountStorageUsed} bytes`);
+});
 
 // Remaining tests to add:
 
