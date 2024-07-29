@@ -1,3 +1,8 @@
+pub mod big_number;
+pub mod fixed_exp;
+pub mod fixed_giga;
+
+use crate::fixed_giga::*;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::{hash, Hash};
 use anchor_lang::solana_program::sysvar::clock::Clock;
@@ -6,8 +11,6 @@ use anchor_lang::system_program::{transfer, Transfer};
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
 const MIN_NUMBER_OF_ORACLES: usize = 8; // Minimum number of oracles to calculate consensus
 const MIN_REPORTS_FOR_REWARD: u32 = 10; // Data Contributor must submit at least 10 reports to be eligible for rewards
-const MIN_COMPLIANCE_SCORE_FOR_REWARD: f32 = 65.0; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
-const MIN_RELIABILITY_SCORE_FOR_REWARD: f32 = 80.0; // Minimum reliability score to be eligible for rewards
 const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount, which is scaled based on the number of highly reliable contributors
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const PERMANENT_BAN_THRESHOLD: u32 = 100; // Number of non-consensus report submissions for permanent ban
@@ -20,6 +23,18 @@ const DATA_RETENTION_PERIOD: u32 = 24 * 60 * 60; // How long to keep data in the
 const SUBMISSION_COUNT_RETENTION_PERIOD: u32 = 24 * 60 * 60; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
+
+const MIN_COMPLIANCE_SCORE_FOR_REWARD: u64 = 65_000000000; // Data Contributor must have a compliance score of at least 80 to be eligible for rewards
+const MIN_RELIABILITY_SCORE_FOR_REWARD: u64 = 80_000000000; // Minimum reliability score to be eligible for rewards
+const BASE_SCORE_INCREMENT: u64 = 20_000000000; // 20.0
+const RELIABILITY_RATIO_THRESHOLD: u64 = 800000000; // 0.8
+const DECAY_RATE: u64 = 990000000; // 0.99
+const MAX_STREAK_BONUS: u64 = 3_000000000; // 3.0
+const MAX_COMPLIANCE_SCORE: u64 = 100_000000000; // 100.0
+const MID_COMPLIANCE_SCORE: u64 = 50_000000000; // 50.0
+
+const ONE_TENTH: u64 = 100000000; // 0.1
+const FIVE_TENTH: u64 = 500000000; // 0.5
 
 #[error_code]
 pub enum OracleError {
@@ -265,32 +280,38 @@ fn apply_bans(contributor: &mut Contributor, current_timestamp: u32, is_accurate
 }
 
 fn update_scores(contributor: &mut Contributor, current_timestamp: u32, is_accurate: bool) {
-    let time_diff = current_timestamp.saturating_sub(contributor.last_active_timestamp);
-    let hours_inactive: f32 = time_diff as f32 / 3_600.0;
+    let time_diff = current_timestamp
+        .saturating_sub(contributor.last_active_timestamp)
+        .to_fixed_giga();
+    let hours_inactive = time_diff.div_up(3600_000000000);
+    let current_streak = contributor.current_streak as u64 * ONE_TENTH;
 
     // Dynamic scaling for accuracy
     let accuracy_scaling = if is_accurate {
-        (1.0 + contributor.current_streak as f32 * 0.1).min(2.0) // Increasing bonus for consecutive accuracy
+        (ONE + current_streak).min(TWO) // Increasing bonus for consecutive accuracy
     } else {
-        1.0
+        ONE
     };
 
-    let time_weight = 1.0 / (1.0 + hours_inactive / 480.0);
+    let time_weight = ONE.div_up(ONE + hours_inactive.div_up(480_000000000));
 
-    let base_score_increment = 20.0; // Adjusted base increment for a more gradual increase
-
-    let score_increment = base_score_increment * accuracy_scaling * time_weight;
+    // Adjusted base increment for a more gradual increase
+    let score_increment = BASE_SCORE_INCREMENT
+        .mul_down(accuracy_scaling)
+        .mul_down(time_weight);
 
     // Exponential penalty for inaccuracies
-    let score_decrement = 20.0 * (1.0 + contributor.consensus_failures as f32 * 0.5).min(3.0);
+    let score_decrement = BASE_SCORE_INCREMENT
+        .mul_up(ONE + contributor.consensus_failures as u64 * FIVE_TENTH)
+        .min(MAX_STREAK_BONUS);
 
-    let decay_rate: f32 = 0.99; // Adjusted decay rate
-    let decay_factor = decay_rate.powf(hours_inactive / 24.0);
+    // Adjusted decay rate 0.99
+    let decay_factor = DECAY_RATE.pow_up(hours_inactive.div_up(24_000000000));
 
     let streak_bonus = if is_accurate {
-        (contributor.current_streak as f32 / 10.0).min(3.0).max(0.0) // Enhanced streak bonus
+        current_streak.min(MAX_STREAK_BONUS) // Enhanced streak bonus
     } else {
-        0.0
+        ZERO
     };
 
     if is_accurate {
@@ -302,26 +323,44 @@ fn update_scores(contributor: &mut Contributor, current_timestamp: u32, is_accur
         contributor.total_reports_submitted += 1;
         contributor.current_streak = 0;
         contributor.consensus_failures += 1;
-        contributor.compliance_score = (contributor.compliance_score - score_decrement).max(0.0);
+        contributor.compliance_score = contributor.compliance_score.saturating_sub(score_decrement);
     }
 
-    contributor.compliance_score *= decay_factor;
+    contributor.compliance_score = contributor.compliance_score.mul_up(decay_factor);
 
     // Integrating reliability score into compliance score calculation
-    let reliability_factor = (contributor.accurate_reports_count as f32
-        / contributor.total_reports_submitted as f32)
-        .clamp(0.0, 1.0);
-    contributor.compliance_score = (contributor.compliance_score * reliability_factor).min(100.0);
+    let reliability_factor = contributor
+        .accurate_reports_count
+        .to_fixed_giga()
+        .div_down(contributor.total_reports_submitted.to_fixed_giga())
+        .clamp(ZERO, ONE);
+    contributor.compliance_score = contributor
+        .compliance_score
+        .mul_down(reliability_factor)
+        .min(MAX_COMPLIANCE_SCORE);
 
-    contributor.compliance_score = logistic_scale(contributor.compliance_score, 100.0, 0.1, 50.0); // Adjusted logistic scaling
+    contributor.compliance_score = logistic_scale(
+        contributor.compliance_score,
+        MAX_COMPLIANCE_SCORE,
+        ONE_TENTH,
+        MID_COMPLIANCE_SCORE,
+    ); // Adjusted logistic scaling
 
-    contributor.reliability_score = reliability_factor * 100.0;
+    contributor.reliability_score = reliability_factor * 100;
 
     log_score_updates(contributor);
 }
 
-fn logistic_scale(score: f32, max_value: f32, steepness: f32, midpoint: f32) -> f32 {
-    max_value / (1.0 + (-steepness * (score - midpoint)).exp())
+fn logistic_scale(score: u64, max_value: u64, steepness: u64, midpoint: u64) -> u64 {
+    // max_value / (1 + e ^ (-steepness * (score - midpoint)))
+    let denom = if score > midpoint {
+        ONE + steepness.mul_down(score - midpoint).neg_exp_down()
+    } else if score < midpoint {
+        ONE + steepness.mul_down(midpoint - score).exp_down()
+    } else {
+        TWO
+    };
+    max_value.div_down(denom)
 }
 
 fn log_score_updates(contributor: &Contributor) {
@@ -341,9 +380,11 @@ fn update_statuses(contributor: &mut Contributor, current_timestamp: u32) {
 
     // Updating reliability status
     contributor.is_reliable = if contributor.total_reports_submitted > 0 {
-        let reliability_ratio =
-            contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32;
-        reliability_ratio >= 0.8 // Example threshold for reliability
+        let reliability_ratio = contributor
+            .accurate_reports_count
+            .to_fixed_giga()
+            .div_up(contributor.total_reports_submitted.to_fixed_giga());
+        reliability_ratio >= RELIABILITY_RATIO_THRESHOLD // Example threshold for reliability
     } else {
         false
     };
@@ -476,10 +517,10 @@ fn post_consensus_tasks(
 fn aggregate_consensus_data(
     aggregated_data_account: &mut Account<AggregatedConsensusDataAccount>,
     report: &PastelTxStatusReport,
-    weight: f32,
+    weight: u64,
     txid: &str,
 ) -> Result<()> {
-    let scaled_weight = (weight * 100.0) as i32; // Scaling by a factor of 100
+    let scaled_weight = weight * 100; // Scaling by a factor of 100
     let current_timestamp = Clock::get()?.unix_timestamp as u32;
 
     // Check if the txid already exists in the aggregated consensus data
@@ -627,7 +668,7 @@ pub fn submit_data_report_helper(
 
     let compliance_score = contributor.compliance_score;
     let reliability_score = contributor.reliability_score;
-    let weight: f32 = compliance_score + reliability_score;
+    let weight = compliance_score + reliability_score;
     aggregate_consensus_data(aggregated_data_account, &report, weight, &txid)?;
 
     // Check for consensus and perform related tasks
@@ -737,12 +778,12 @@ pub fn add_pending_payment_helper(
 pub struct Contributor {
     pub reward_address: Pubkey,
     pub registration_entrance_fee_transaction_signature: String,
-    pub compliance_score: f32,
+    pub compliance_score: u64,
     pub last_active_timestamp: u32,
     pub total_reports_submitted: u32,
     pub accurate_reports_count: u32,
     pub current_streak: u32,
-    pub reliability_score: f32,
+    pub reliability_score: u64,
     pub consensus_failures: u32,
     pub ban_expiry: u32,
     pub is_eligible_for_rewards: bool,
@@ -1011,11 +1052,11 @@ impl<'info> ReallocateOracleState<'info> {
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct HashWeight {
     pub hash: String,
-    pub weight: i32,
+    pub weight: u64,
 }
 
 // Function to update hash weight
-fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i32) {
+fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: u64) {
     let mut found = false;
 
     for hash_weight in hash_weights.iter_mut() {
@@ -1038,7 +1079,7 @@ fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i3
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct AggregatedConsensusData {
     pub txid: String,
-    pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
+    pub status_weights: [u64; TXID_STATUS_VARIANT_COUNT],
     pub hash_weights: Vec<HashWeight>,
     pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
     pub last_updated: u32, // Unix timestamp indicating the last update time
@@ -1191,12 +1232,12 @@ pub fn register_new_data_contributor_helper(
     let new_contributor = Contributor {
         reward_address: *ctx.accounts.contributor_account.key,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
-        compliance_score: 1.0,                                          // Initial compliance score
+        compliance_score: ONE,                                          // Initial compliance score
         last_active_timestamp, // Set the last active timestamp to the current time
         total_reports_submitted: 0, // Initially, no reports have been submitted
         accurate_reports_count: 0, // Initially, no accurate reports
         current_streak: 0,     // No streak at the beginning
-        reliability_score: 1.0, // Initial reliability score
+        reliability_score: ONE, // Initial reliability score
         consensus_failures: 0, // No consensus failures at the start
         ban_expiry: 0,         // No ban initially set
         is_eligible_for_rewards: false, // Initially not eligible for rewards

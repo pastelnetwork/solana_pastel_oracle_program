@@ -1,24 +1,19 @@
+import { assert, expect } from "chai";
+import Decimal from "decimal.js";
+import * as crypto from "crypto";
 import * as anchor from "@coral-xyz/anchor";
 import { Program, web3, AnchorProvider, BN } from "@coral-xyz/anchor";
-import {
-  SolanaPastelOracleProgram,
-} from "../target/types/solana_pastel_oracle_program";
+import { ComputeBudgetProgram, SystemProgram } from "@solana/web3.js";
+import { SolanaPastelOracleProgram } from "../target/types/solana_pastel_oracle_program";
 import IDL from "../target/idl/solana_pastel_oracle_program.json";
-import { assert, expect } from "chai";
-import * as crypto from "crypto";
-import { SystemProgram } from "@solana/web3.js";
-const { ComputeBudgetProgram, Transaction, PublicKey } = anchor.web3;
 
-const TURN_ON_STORAGE_AND_COMPUTE_PROFILING = true;  // Set this flag to true to enable profiling
+const TURN_ON_STORAGE_AND_COMPUTE_PROFILING = true; // Set this flag to true to enable profiling
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 process.env.RUST_LOG =
   "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
-const program = new Program<SolanaPastelOracleProgram>(
-  IDL as any,
-  provider
-);
+const program = new Program<SolanaPastelOracleProgram>(IDL as any, provider);
 const admin = provider.wallet; // Use the provider's wallet
 const oracleContractState = web3.Keypair.generate();
 let contributors = []; // Array to store contributor keypairs
@@ -34,8 +29,8 @@ const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_NUMBER_OF_ORACLES = 8;
 const MIN_REPORTS_FOR_REWARD = 10;
 const BAD_CONTRIBUTOR_INDEX = 5; // Define a constant to represent the index at which contributors start submitting incorrect reports with increasing probability
-const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
-const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
+const MIN_COMPLIANCE_SCORE_FOR_REWARD = new BN(65_000000000);
+const MIN_RELIABILITY_SCORE_FOR_REWARD = new BN(80_000000000);
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
 
 const TxidStatusEnum = {
@@ -63,13 +58,18 @@ const measureComputeUnitsAndStorage = async (txSignature: string) => {
 
   // Retry logic to handle cases where the transaction might not be immediately available
   for (let attempts = 0; attempts < 5; attempts++) {
-    const txDetails = await provider.connection.getParsedTransaction(txSignature, { commitment: 'confirmed' });
+    const txDetails = await provider.connection.getParsedTransaction(
+      txSignature,
+      { commitment: "confirmed" }
+    );
     if (txDetails) {
       if (txDetails.meta && txDetails.meta.computeUnitsConsumed) {
         totalComputeUnitsUsed += txDetails.meta.computeUnitsConsumed;
       }
 
-      const accounts = txDetails.transaction.message.accountKeys.map(key => new web3.PublicKey(key.pubkey));
+      const accounts = txDetails.transaction.message.accountKeys.map(
+        (key) => new web3.PublicKey(key.pubkey)
+      );
       for (const account of accounts) {
         const accountInfo = await provider.connection.getAccountInfo(account);
         if (accountInfo && accountInfo.data.length > maxAccountStorageUsed) {
@@ -79,9 +79,11 @@ const measureComputeUnitsAndStorage = async (txSignature: string) => {
       return; // Exit if transaction details are successfully processed
     }
     // Wait a bit before retrying
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   }
-  console.error(`Failed to fetch transaction details for signature: ${txSignature}`);
+  console.error(
+    `Failed to fetch transaction details for signature: ${txSignature}`
+  );
 };
 
 describe("Initialization", () => {
@@ -98,11 +100,10 @@ describe("Initialization", () => {
       );
 
     // Find the PDA for the ContributorDataAccount
-    const [contributorDataAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("contributor_data")],
-        program.programId
-      );
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
 
     // Find the PDA for the TxidSubmissionCountsAccount
     const [txidSubmissionCountsAccountPDA] =
@@ -144,7 +145,7 @@ describe("Initialization", () => {
     await provider.sendAndConfirm(fundTx);
     const fundTxSignature = await provider.sendAndConfirm(fundTx);
     await measureComputeUnitsAndStorage(fundTxSignature);
-    
+
     // Initial Initialization
     console.log("Initializing Oracle Contract State");
     const initTxSignature = await program.methods
@@ -180,7 +181,8 @@ describe("Initialization", () => {
 
     while (currentSize < maxSize) {
       console.log(
-        `Expanding Oracle Contract State size from ${currentSize} to ${currentSize + 10_240
+        `Expanding Oracle Contract State size from ${currentSize} to ${
+          currentSize + 10_240
         }`
       );
       const reallocateTxSignature = await program.methods
@@ -257,11 +259,10 @@ describe("Contributor Registration", () => {
         program.programId
       );
 
-    const [contributorDataAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("contributor_data")],
-        program.programId
-      );
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
 
     for (let i = 0; i < NUM_CONTRIBUTORS; i++) {
       // Generate a new keypair for each contributor
@@ -317,7 +318,8 @@ describe("Contributor Registration", () => {
       );
       assert.isTrue(
         isRegistered,
-        `Contributor ${index + 1
+        `Contributor ${
+          index + 1
         } should be registered in ContributorDataAccount`
       );
     });
@@ -440,7 +442,7 @@ describe("TXID Monitoring Verification", () => {
       assert.strictEqual(
         pendingPaymentData.pendingPayment.expectedAmount.toNumber(),
         COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING *
-        web3.LAMPORTS_PER_SOL,
+          web3.LAMPORTS_PER_SOL,
         `The expected amount in PendingPayment should match for TXID: ${txid}`
       );
 
@@ -480,11 +482,10 @@ describe("Data Report Submission", () => {
     }
 
     // Find the PDA for the ContributorDataAccount
-    const [contributorDataAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("contributor_data")],
-        program.programId
-      );
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
 
     // Find the PDA for the TxidSubmissionCountsAccount
     const [txidSubmissionCountsAccountPDA] =
@@ -526,7 +527,7 @@ describe("Data Report Submission", () => {
           i < BAD_CONTRIBUTOR_INDEX
             ? 0
             : (i - BAD_CONTRIBUTOR_INDEX + 1) /
-            (contributors.length - BAD_CONTRIBUTOR_INDEX);
+              (contributors.length - BAD_CONTRIBUTOR_INDEX);
         const isIncorrect = Math.random() < errorProbability;
 
         // Randomize the status value for each report
@@ -559,14 +560,9 @@ describe("Data Report Submission", () => {
           program.programId
         );
 
-        // Create and send the transaction
+        // Attempt to submit the data report
         try {
-          const transaction = new Transaction();
-          transaction.add(
-            ComputeBudgetProgram.setComputeUnitLimit({ units: 1400000 })
-          );
-
-          const submitDataReportInstruction = await program.methods
+          const submitTxSignature = await program.methods
             .submitDataReport(
               txid,
               { [txidStatusValue.toString()]: {} } as unknown as any, // TODO: better typing
@@ -584,40 +580,50 @@ describe("Data Report Submission", () => {
               user: contributor.publicKey,
               systemProgram: web3.SystemProgram.programId,
             })
+            .preInstructions([
+              ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+            ])
             .signers([contributor])
-            .instruction();
+            .rpc();
+          await measureComputeUnitsAndStorage(submitTxSignature);
 
-          transaction.add(submitDataReportInstruction);
-
-          // Attempt to submit the data report
-          try {
-            const submitTxSignature = await provider.sendAndConfirm(transaction, [contributor]);
-            await measureComputeUnitsAndStorage(submitTxSignature);            
-            console.log(`Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`);
-          } catch (error) {
-            const anchorError = anchor.AnchorError.parse(error.logs);
-            if (anchorError) {
-              if (anchorError.error.errorCode.code === 'ContributorBanned' && i >= BAD_CONTRIBUTOR_INDEX) {
-                console.log(`Expected 'ContributorBanned' error for contributor ${contributor.publicKey.toBase58()}: ${anchorError.error.errorMessage}`);
-              } else if (anchorError.error.errorCode.code === 'EnoughReportsSubmittedForTxid' && i >= MIN_NUMBER_OF_ORACLES) {
-                console.log(`Expected 'EnoughReportsSubmittedForTxid' error for contributor ${contributor.publicKey.toBase58()}: ${anchorError.error.errorMessage}`);
-              } else {
-                console.error(`Unexpected error: ${anchorError.error.errorCode.code || 'Unknown error'} - ${anchorError.error.errorMessage}`);
-                // Decide if you want to throw the error or continue
-              }
-            } else {
-              console.error(`Error parsing error code: ${error.toString()}`);
-            }
-          }
-        } catch (error) {
-          console.error(
-            `Error submitting report for TXID ${txid} by contributor ${contributor.publicKey.toBase58()}:`,
-            error
+          console.log(
+            `Data report for TXID ${txid} submitted by contributor ${contributor.publicKey.toBase58()}`
           );
-          throw error;
+        } catch (error) {
+          const anchorError = anchor.AnchorError.parse(error.logs);
+          if (anchorError) {
+            if (
+              anchorError.error.errorCode.code === "ContributorBanned" &&
+              i >= BAD_CONTRIBUTOR_INDEX
+            ) {
+              console.log(
+                `Expected 'ContributorBanned' error for contributor ${contributor.publicKey.toBase58()}: ${
+                  anchorError.error.errorMessage
+                }`
+              );
+            } else if (
+              anchorError.error.errorCode.code ===
+                "EnoughReportsSubmittedForTxid" &&
+              i >= MIN_NUMBER_OF_ORACLES
+            ) {
+              console.log(
+                `Expected 'EnoughReportsSubmittedForTxid' error for contributor ${contributor.publicKey.toBase58()}: ${
+                  anchorError.error.errorMessage
+                }`
+              );
+            } else {
+              console.error(
+                `Unexpected error: ${
+                  anchorError.error.errorCode.code || "Unknown error"
+                } - ${anchorError.error.errorMessage}`
+              );
+              // Decide if you want to throw the error or continue
+            }
+          } else {
+            console.error(`Error parsing error code: ${error.toString()}`);
+          }
         }
-
-
       }
 
       // Fetch the consensus data from the AggregatedConsensusDataAccount PDA
@@ -630,8 +636,14 @@ describe("Data Report Submission", () => {
       );
 
       if (consensusData) {
-        const consensusStatusIndex = consensusData.statusWeights.indexOf(
-          Math.max(...consensusData.statusWeights)
+        const maxWeight = [...consensusData.statusWeights].sort((a, b) =>
+          new Decimal(b.sub(a).toString())
+            .div(new Decimal(1e9))
+            .toDP(9)
+            .toNumber()
+        )[0];
+        const consensusStatusIndex = consensusData.statusWeights.findIndex(
+          (weight) => weight.eq(maxWeight)
         );
         const consensusStatus = [
           "Invalid",
@@ -647,7 +659,6 @@ describe("Data Report Submission", () => {
 
     // Loop through each monitored TXID for validation
     for (const txid of monitoredTxids) {
-
       // Fetch the updated state after all submissions for this TXID
       const updatedState = await program.account.oracleContractState.fetch(
         oracleContractState.publicKey
@@ -675,8 +686,14 @@ describe("Data Report Submission", () => {
       );
 
       // Assuming the consensus is based on the weighted majority rule
-      const consensusStatusIndex = consensusData.statusWeights.indexOf(
-        Math.max(...consensusData.statusWeights)
+      const maxWeight = [...consensusData.statusWeights].sort((a, b) =>
+        new Decimal(b.sub(a).toString())
+          .div(new Decimal(1e9))
+          .toDP(9)
+          .toNumber()
+      )[0];
+      const consensusStatusIndex = consensusData.statusWeights.findIndex(
+        (weight) => weight.eq(maxWeight)
       );
       const consensusStatus = [
         "Invalid",
@@ -694,8 +711,8 @@ describe("Data Report Submission", () => {
 
       // Check for the hash with the highest weight
       const consensusHash = consensusData.hashWeights.reduce(
-        (max, h) => (max.weight > h.weight ? max : h),
-        { hash: "", weight: -1 }
+        (max, h) => (max.weight.gt(h.weight) ? max : h),
+        { hash: "", weight: new BN(0) }
       ).hash;
       console.log(`Consensus Hash for TXID ${txid}:`, consensusHash);
 
@@ -775,25 +792,31 @@ describe("Data Cleanup Verification", () => {
       program.programId
     );
 
-    const tempReportAccountData = await program.account.tempTxStatusReportAccount.fetch(tempReportAccountPDA);
+    const tempReportAccountData =
+      await program.account.tempTxStatusReportAccount.fetch(
+        tempReportAccountPDA
+      );
 
-    txidsToCheck.forEach(txid => {
-      const isTxidPresentInTempReport = tempReportAccountData.reports.some(report => {
-        const commonDataIndex = report.commonDataRef.toNumber(); // Convert BN to number
-        const commonData = tempReportAccountData.commonReports[commonDataIndex]; // Use converted index
-        return commonData.txid === txid;
-      });
+    txidsToCheck.forEach((txid) => {
+      const isTxidPresentInTempReport = tempReportAccountData.reports.some(
+        (report) => {
+          const commonDataIndex = report.commonDataRef.toNumber(); // Convert BN to number
+          const commonData =
+            tempReportAccountData.commonReports[commonDataIndex]; // Use converted index
+          return commonData.txid === txid;
+        }
+      );
       assert.isFalse(
         isTxidPresentInTempReport,
         `TXID ${txid} should be cleaned up from TempTxStatusReportAccount`
       );
-
     });
 
-    console.log("Data cleanup post-consensus verification completed successfully.");
+    console.log(
+      "Data cleanup post-consensus verification completed successfully."
+    );
   });
 });
-
 
 describe("Payment Processing by Bridge Contract", () => {
   it("Processes payments for monitored TXIDs", async () => {
@@ -824,7 +847,9 @@ describe("Payment Processing by Bridge Contract", () => {
         })
       );
 
-      const transferTxSignature = await provider.sendAndConfirm(transferTransaction);
+      const transferTxSignature = await provider.sendAndConfirm(
+        transferTransaction
+      );
       await measureComputeUnitsAndStorage(transferTxSignature);
       console.log(
         `Transferred payment for TXID ${txid} to fee-receiving contract`
@@ -878,15 +903,13 @@ describe("Payment Processing by Bridge Contract", () => {
   });
 });
 
-
 describe("Eligibility for Rewards", () => {
   it("should check if contributors meet reward eligibility criteria", async () => {
     // Fetch the ContributorDataAccount
-    const [contributorDataAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("contributor_data")],
-        program.programId
-      );
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
 
     const contributorData = await program.account.contributorDataAccount.fetch(
       contributorDataAccountPDA
@@ -941,21 +964,24 @@ describe("Eligibility for Rewards", () => {
 
       // Define your eligibility criteria based on your contract logic
       const isEligibleForRewards =
-        currentContributorData.totalReportsSubmitted >= MIN_REPORTS_FOR_REWARD &&
-        currentContributorData.reliabilityScore >= MIN_RELIABILITY_SCORE_FOR_REWARD &&
-        currentContributorData.complianceScore >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
-
+        currentContributorData.totalReportsSubmitted >=
+          MIN_REPORTS_FOR_REWARD &&
+        currentContributorData.reliabilityScore.gte(
+          MIN_RELIABILITY_SCORE_FOR_REWARD
+        ) &&
+        currentContributorData.complianceScore.gte(
+          MIN_COMPLIANCE_SCORE_FOR_REWARD
+        );
       assert(
         currentContributorData.isEligibleForRewards === isEligibleForRewards,
         `Eligibility for rewards for contributor with address ${contributor.publicKey.toBase58()} should be correctly determined`
       );
-
     }
   });
 });
 
-describe('Reward Distribution for Eligible Contributor', () => {
-  it('should distribute rewards correctly from the reward pool', async () => {
+describe("Reward Distribution for Eligible Contributor", () => {
+  it("should distribute rewards correctly from the reward pool", async () => {
     // Choose an eligible contributor
     const eligibleContributor = contributors[0]; // Assuming the first contributor is eligible
 
@@ -971,18 +997,26 @@ describe('Reward Distribution for Eligible Contributor', () => {
     );
 
     // Get initial balances
-    const initialRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+    const initialRewardPoolBalance = await provider.connection.getBalance(
+      rewardPoolAccountPDA
+    );
     console.log(`Initial reward pool balance: ${initialRewardPoolBalance}`);
 
-    const initialContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
+    const initialContributorBalance = await provider.connection.getBalance(
+      eligibleContributor.publicKey
+    );
     console.log(`Initial contributor balance: ${initialContributorBalance}`);
 
-    const initialOracleContractStateBalance = await provider.connection.getBalance(oracleContractState.publicKey);
-    console.log(`Initial oracle contract state balance: ${initialOracleContractStateBalance}`);
+    const initialOracleContractStateBalance =
+      await provider.connection.getBalance(oracleContractState.publicKey);
+    console.log(
+      `Initial oracle contract state balance: ${initialOracleContractStateBalance}`
+    );
 
     try {
       // Request reward for the eligible contributor
-      const requestRewardTxSignature = await program.methods.requestReward(eligibleContributor.publicKey)
+      const requestRewardTxSignature = await program.methods
+        .requestReward(eligibleContributor.publicKey)
         .accountsPartial({
           rewardPoolAccount: rewardPoolAccountPDA,
           oracleContractState: oracleContractState.publicKey,
@@ -1000,33 +1034,51 @@ describe('Reward Distribution for Eligible Contributor', () => {
     }
 
     // Wait for the transaction to be confirmed
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
 
     // Get updated balances
-    const updatedRewardPoolBalance = await provider.connection.getBalance(rewardPoolAccountPDA);
+    const updatedRewardPoolBalance = await provider.connection.getBalance(
+      rewardPoolAccountPDA
+    );
     console.log(`Updated reward pool balance: ${updatedRewardPoolBalance}`);
 
-    const updatedContributorBalance = await provider.connection.getBalance(eligibleContributor.publicKey);
+    const updatedContributorBalance = await provider.connection.getBalance(
+      eligibleContributor.publicKey
+    );
     console.log(`Updated contributor balance: ${updatedContributorBalance}`);
 
-    const updatedOracleContractStateBalance = await provider.connection.getBalance(oracleContractState.publicKey);
-    console.log(`Updated oracle contract state balance: ${updatedOracleContractStateBalance}`);
+    const updatedOracleContractStateBalance =
+      await provider.connection.getBalance(oracleContractState.publicKey);
+    console.log(
+      `Updated oracle contract state balance: ${updatedOracleContractStateBalance}`
+    );
 
     // Check if the reward pool balance decreased by the correct amount
-    const rewardPoolDifference = initialRewardPoolBalance - updatedRewardPoolBalance;
-    expect(rewardPoolDifference).to.equal(BASE_REWARD_AMOUNT_IN_LAMPORTS, "Reward pool should decrease by the reward amount");
+    const rewardPoolDifference =
+      initialRewardPoolBalance - updatedRewardPoolBalance;
+    expect(rewardPoolDifference).to.equal(
+      BASE_REWARD_AMOUNT_IN_LAMPORTS,
+      "Reward pool should decrease by the reward amount"
+    );
 
     // Check if the contributor balance increased by the correct amount
-    const contributorDifference = updatedContributorBalance - initialContributorBalance;
-    expect(contributorDifference).to.equal(BASE_REWARD_AMOUNT_IN_LAMPORTS, "Contributor balance should increase by the reward amount");
+    const contributorDifference =
+      updatedContributorBalance - initialContributorBalance;
+    expect(contributorDifference).to.equal(
+      BASE_REWARD_AMOUNT_IN_LAMPORTS,
+      "Contributor balance should increase by the reward amount"
+    );
 
     // The oracle contract state balance should not change
-    expect(updatedOracleContractStateBalance).to.equal(initialOracleContractStateBalance, "Oracle contract state balance should not change");
+    expect(updatedOracleContractStateBalance).to.equal(
+      initialOracleContractStateBalance,
+      "Oracle contract state balance should not change"
+    );
   });
 });
 
-describe('Request Reward for Ineligible Contributor', () => {
-  it('should not allow reward requests from ineligible contributors', async () => {
+describe("Request Reward for Ineligible Contributor", () => {
+  it("should not allow reward requests from ineligible contributors", async () => {
     // Choose an ineligible contributor
     const ineligibleContributor = contributors[contributors.length - 1]; // Assuming the last contributor is ineligible
 
@@ -1036,38 +1088,43 @@ describe('Request Reward for Ineligible Contributor', () => {
       program.programId
     );
 
-    const [contributorDataAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("contributor_data")],
-        program.programId
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
+
+    try {
+      // Attempt to request reward
+      const requestRewardTxSignature = await program.methods
+        .requestReward(ineligibleContributor.publicKey)
+        .accountsPartial({
+          rewardPoolAccount: rewardPoolAccountPDA,
+          oracleContractState: oracleContractState.publicKey,
+          contributorDataAccount: contributorDataAccountPDA,
+        })
+        .rpc();
+      await measureComputeUnitsAndStorage(requestRewardTxSignature);
+
+      throw new Error(
+        "Reward request should have failed for ineligible contributor"
       );
-
-      try {
-        // Attempt to request reward
-        const requestRewardTxSignature = await program.methods.requestReward(ineligibleContributor.publicKey)
-          .accountsPartial({
-            rewardPoolAccount: rewardPoolAccountPDA,
-            oracleContractState: oracleContractState.publicKey,
-            contributorDataAccount: contributorDataAccountPDA
-          })
-          .rpc();
-        await measureComputeUnitsAndStorage(requestRewardTxSignature);
-  
-        throw new Error('Reward request should have failed for ineligible contributor');
-      } catch (error) {
-        const anchorError = anchor.AnchorError.parse(error.logs);
-        if (anchorError) {
-          assert.equal(anchorError.error.errorCode.code, 'NotEligibleForReward', 'Should throw NotEligibleForReward error');
-        } else {
-          console.error(`Error parsing error code: ${error.toString()}`);
-          // Decide on handling unparsed errors
-        }
+    } catch (error) {
+      const anchorError = anchor.AnchorError.parse(error.logs);
+      if (anchorError) {
+        assert.equal(
+          anchorError.error.errorCode.code,
+          "NotEligibleForReward",
+          "Should throw NotEligibleForReward error"
+        );
+      } else {
+        console.error(`Error parsing error code: ${error.toString()}`);
+        // Decide on handling unparsed errors
       }
-    });
+    }
   });
-  
+});
 
-  // After all tests
+// After all tests
 after(async function () {
   console.log(`Total compute units used: ${totalComputeUnitsUsed}`);
   console.log(`Max account storage used: ${maxAccountStorageUsed} bytes`);
