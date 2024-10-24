@@ -42,7 +42,7 @@ rustc --version
 ```bash
 sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y  
 sudo apt install libssl-dev libudev-dev pkg-config zlib1g-dev llvm clang make -y         
-sh -c "$(curl -sSfL https://release.solana.com/v1.17.13/install)"      
+sh -c "$(curl -sSfL https://release.solana.com/v1.18.15/install)"      
 export PATH="/home/ubuntu/.local/share/solana/install/active_release/bin:$PATH" 
 source ~/.zshrc   # If you use Zsh
 solana --version  

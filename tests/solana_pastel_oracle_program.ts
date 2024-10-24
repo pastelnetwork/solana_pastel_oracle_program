@@ -1124,38 +1124,521 @@ describe("Request Reward for Ineligible Contributor", () => {
   });
 });
 
+describe("Reallocation of Oracle State", () => {
+  it("Simulates account reallocation when capacity is reached", async () => {
+    // Find PDAs 
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
+
+    const [feeReceivingContractAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_receiving_contract")],
+      program.programId
+    );
+
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reward_pool")], 
+      program.programId
+    );
+
+    // First get initial sizes of accounts
+    const initialContributorDataSize = (await provider.connection.getAccountInfo(contributorDataAccountPDA)).data.length;
+    console.log("Initial ContributorData size:", initialContributorDataSize);
+
+    // We'll add contributors until we need reallocation
+    // Each Contributor struct is roughly ~200 bytes
+    // Initial size of 10_240 means we can fit ~50 contributors before needing reallocation
+    const contributorsToAdd = 60; // This should force at least one reallocation
+
+    for (let i = 0; i < contributorsToAdd; i++) {
+      const newContributor = web3.Keypair.generate();
+
+      // Fund the fee receiving account for registration
+      const fundTx = new web3.Transaction().add(
+        web3.SystemProgram.transfer({
+          fromPubkey: admin.publicKey,
+          toPubkey: feeReceivingContractAccountPDA,
+          lamports: REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL,
+        })
+      );
+      
+      await provider.sendAndConfirm(fundTx);
+
+      try {
+        // Try to register new contributor
+        const tx = await program.methods
+          .registerNewDataContributor()
+          .accountsPartial({
+            contributorDataAccount: contributorDataAccountPDA,
+            contributorAccount: newContributor.publicKey,
+            rewardPoolAccount: rewardPoolAccountPDA,
+            feeReceivingContractAccount: feeReceivingContractAccountPDA,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([newContributor])
+          .rpc();
+
+        console.log(`Successfully registered contributor ${i + 1}`);
+
+      } catch (error) {
+        // If we get a specific error about account size, trigger reallocation
+        if (error.toString().includes("AccountDidNotFit") || 
+            error.toString().includes("0x1")) {
+          
+          console.log("Account capacity reached, performing reallocation...");
+          
+          // Trigger reallocation
+          const reallocateTx = await program.methods
+            .reallocateOracleState()
+            .accountsPartial({
+              oracleContractState: oracleContractState.publicKey,
+              adminPubkey: admin.publicKey,
+              contributorDataAccount: contributorDataAccountPDA,
+              systemProgram: web3.SystemProgram.programId,
+            })
+            .rpc();
+
+          // Retry registration after reallocation
+          await program.methods
+            .registerNewDataContributor()
+            .accountsPartial({
+              contributorDataAccount: contributorDataAccountPDA,
+              contributorAccount: newContributor.publicKey,
+              rewardPoolAccount: rewardPoolAccountPDA,
+              feeReceivingContractAccount: feeReceivingContractAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([newContributor])
+            .rpc();
+
+          console.log("Successfully registered after reallocation");
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    // Verify final account size and successful registrations
+    const finalContributorDataSize = (await provider.connection.getAccountInfo(contributorDataAccountPDA)).data.length;
+    console.log("Final ContributorData size:", finalContributorDataSize);
+    
+    // Verify the data
+    const contributorData = await program.account.contributorDataAccount.fetch(contributorDataAccountPDA);
+    
+    assert(
+      finalContributorDataSize > initialContributorDataSize,
+      "Account size should have increased after reallocation"
+    );
+
+    assert(
+      contributorData.contributors.length >= contributorsToAdd,
+      "All contributors should be registered after reallocation"
+    );
+  });
+});
+
+// describe("Reallocation of Oracle State", () => {
+//   it("Simulates account reallocation when capacity is reached", async () => {
+//     // Find the PDAs for the accounts that support reallocation
+//     const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("contributor_data")],
+//       program.programId
+//     );
+
+//     const [tempReportAccountPDA] = web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("temp_tx_status_report")],
+//       program.programId
+//     );
+
+//     const [txidSubmissionCountsAccountPDA] =
+//       web3.PublicKey.findProgramAddressSync(
+//         [Buffer.from("txid_submission_counts")],
+//         program.programId
+//       );
+
+//     const [aggregatedConsensusDataAccountPDA] =
+//       web3.PublicKey.findProgramAddressSync(
+//         [Buffer.from("aggregated_consensus_data")],
+//         program.programId
+//       );
+
+//     // Simulate adding data until accounts reach capacity
+//     // For example, we can add many contributors to fill up the contributorDataAccount
+
+//     const initialContributorsCount = contributors.length;
+//     const additionalContributorsNeeded = 500; // Number to potentially exceed initial capacity
+
+//     for (let i = 0; i < additionalContributorsNeeded; i++) {
+//       const contributor = web3.Keypair.generate();
+
+//       // Transfer the registration fee to feeReceivingContractAccount PDA
+//       const [feeReceivingContractAccountPDA] =
+//         web3.PublicKey.findProgramAddressSync(
+//           [Buffer.from("fee_receiving_contract")],
+//           program.programId
+//         );
+
+//       const transaction = new web3.Transaction().add(
+//         web3.SystemProgram.transfer({
+//           fromPubkey: admin.publicKey,
+//           toPubkey: feeReceivingContractAccountPDA,
+//           lamports: REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL,
+//         })
+//       );
+
+//       await provider.sendAndConfirm(transaction);
+
+//       // Call the RPC method to register the new data contributor
+//       try {
+//         await program.methods
+//           .registerNewDataContributor()
+//           .accountsPartial({
+//             contributorDataAccount: contributorDataAccountPDA,
+//             contributorAccount: contributor.publicKey,
+//             rewardPoolAccount: feeReceivingContractAccountPDA, // Assuming reward pool is the same PDA
+//             feeReceivingContractAccount: feeReceivingContractAccountPDA,
+//             systemProgram: SystemProgram.programId,
+//           })
+//           .signers([contributor])
+//           .rpc();
+//       } catch (error) {
+//         // Check if the error is due to account needing reallocation
+//         const anchorError = anchor.AnchorError.parse(error.logs);
+//         if (anchorError) {
+//           if (
+//             anchorError.error.errorCode.code === "AccountDidNotFit" ||
+//             anchorError.error.errorMessage.includes("Account reallocation required")
+//           ) {
+//             console.log(
+//               "Account reached capacity, triggering reallocation for ContributorDataAccount"
+//             );
+//             // Trigger reallocation
+//             await program.methods
+//               .reallocateOracleState()
+//               .accountsStrict({
+//                 oracleContractState: oracleContractState.publicKey,
+//                 adminPubkey: admin.publicKey,
+//                 tempReportAccount: tempReportAccountPDA,
+//                 contributorDataAccount: contributorDataAccountPDA,
+//                 txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
+//                 aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+//                 systemProgram: web3.SystemProgram.programId,
+//               })
+//               .rpc();
+
+//             // Retry the registration
+//             await program.methods
+//               .registerNewDataContributor()
+//               .accountsPartial({
+//                 contributorDataAccount: contributorDataAccountPDA,
+//                 contributorAccount: contributor.publicKey,
+//                 rewardPoolAccount: feeReceivingContractAccountPDA,
+//                 feeReceivingContractAccount: feeReceivingContractAccountPDA,
+//                 systemProgram: SystemProgram.programId,
+//               })
+//               .signers([contributor])
+//               .rpc();
+//           } else {
+//             throw error;
+//           }
+//         } else {
+//           throw error;
+//         }
+//       }
+
+//       contributors.push(contributor);
+//     }
+
+//     // Verify that all contributors are registered
+//     const contributorData = await program.account.contributorDataAccount.fetch(
+//       contributorDataAccountPDA
+//     );
+
+//     assert.equal(
+//       contributorData.contributors.length,
+//       initialContributorsCount + additionalContributorsNeeded,
+//       "All contributors should be registered after reallocation"
+//     );
+
+//     console.log(
+//       "Reallocation test passed: ContributorDataAccount successfully reallocated when capacity was reached."
+//     );
+
+//     // Similar steps can be followed for other accounts that support reallocation
+//   });
+// });
+
+
+
+// describe("Withdrawal of Funds", () => {
+//   it("Allows admin to withdraw funds from reward pool and fee-receiving contract", async () => {
+//     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
+//     const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("reward_pool")],
+//       program.programId
+//     );
+
+//     const [feeReceivingContractAccountPDA] =
+//       web3.PublicKey.findProgramAddressSync(
+//         [Buffer.from("fee_receiving_contract")],
+//         program.programId
+//       );
+
+//     // Get initial balances
+//     const initialRewardPoolBalance = await provider.connection.getBalance(
+//       rewardPoolAccountPDA
+//     );
+
+//     const initialFeeReceivingBalance = await provider.connection.getBalance(
+//       feeReceivingContractAccountPDA
+//     );
+
+//     const adminInitialBalance = await provider.connection.getBalance(
+//       admin.publicKey
+//     );
+
+//     // Withdraw funds
+//     const rewardPoolWithdrawalAmount = initialRewardPoolBalance / 2; // Withdraw half
+//     const feeReceivingWithdrawalAmount = initialFeeReceivingBalance / 2; // Withdraw half
+
+//     await program.methods
+//       .withdrawFunds(
+//         new BN(rewardPoolWithdrawalAmount),
+//         new BN(feeReceivingWithdrawalAmount)
+//       )
+//       .accountsPartial({
+//         oracleContractState: oracleContractState.publicKey,
+//         adminAccount: admin.publicKey,
+//         rewardPoolAccount: rewardPoolAccountPDA,
+//         feeReceivingContractAccount: feeReceivingContractAccountPDA,
+//         systemProgram: web3.SystemProgram.programId,
+//       })
+//       .rpc();
+
+//     // Get updated balances
+//     const updatedRewardPoolBalance = await provider.connection.getBalance(
+//       rewardPoolAccountPDA
+//     );
+
+//     const updatedFeeReceivingBalance = await provider.connection.getBalance(
+//       feeReceivingContractAccountPDA
+//     );
+
+//     const adminUpdatedBalance = await provider.connection.getBalance(
+//       admin.publicKey
+//     );
+
+//     // Assertions
+//     assert.equal(
+//       updatedRewardPoolBalance,
+//       initialRewardPoolBalance - rewardPoolWithdrawalAmount,
+//       "Reward pool balance should decrease by the withdrawal amount"
+//     );
+
+//     assert.equal(
+//       updatedFeeReceivingBalance,
+//       initialFeeReceivingBalance - feeReceivingWithdrawalAmount,
+//       "Fee receiving contract balance should decrease by the withdrawal amount"
+//     );
+
+//     assert.equal(
+//       adminUpdatedBalance,
+//       adminInitialBalance + rewardPoolWithdrawalAmount + feeReceivingWithdrawalAmount,
+//       "Admin balance should increase by the total withdrawal amount"
+//     );
+
+//     console.log(
+//       "Withdrawal of funds test passed: Admin successfully withdrew funds."
+//     );
+//   });
+
+//   it("Prevents unauthorized users from withdrawing funds", async () => {
+//     // Create a non-admin user
+//     const unauthorizedUser = web3.Keypair.generate();
+
+//     // Airdrop some SOL to unauthorized user
+//     await provider.connection.confirmTransaction(
+//       await provider.connection.requestAirdrop(
+//         unauthorizedUser.publicKey,
+//         web3.LAMPORTS_PER_SOL
+//       )
+//     );
+
+//     // Attempt to withdraw funds as unauthorized user
+//     try {
+//       await program.methods
+//         .withdrawFunds(new BN(1000), new BN(1000))
+//         .accountsPartial({
+//           oracleContractState: oracleContractState.publicKey,
+//           adminAccount: unauthorizedUser.publicKey,
+//           rewardPoolAccount: oracleContractState.publicKey, // Dummy account
+//           feeReceivingContractAccount: oracleContractState.publicKey, // Dummy account
+//           systemProgram: web3.SystemProgram.programId,
+//         })
+//         .signers([unauthorizedUser])
+//         .rpc();
+
+//       throw new Error(
+//         "Unauthorized user should not be able to withdraw funds, but withdrawal succeeded."
+//       );
+//     } catch (error) {
+//       const anchorError = anchor.AnchorError.parse(error.logs);
+//       if (anchorError) {
+//         assert.equal(
+//           anchorError.error.errorCode.code,
+//           "UnauthorizedWithdrawalAccount",
+//           "Should throw UnauthorizedWithdrawalAccount error"
+//         );
+//       } else {
+//         throw error;
+//       }
+//     }
+
+//     console.log(
+//       "Unauthorized withdrawal test passed: Unauthorized user was prevented from withdrawing funds."
+//     );
+//   });
+
+//   it("Prevents withdrawal of amounts exceeding account balances", async () => {
+//     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
+//     const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("reward_pool")],
+//       program.programId
+//     );
+
+//     const [feeReceivingContractAccountPDA] =
+//       web3.PublicKey.findProgramAddressSync(
+//         [Buffer.from("fee_receiving_contract")],
+//         program.programId
+//       );
+
+//     // Get current balances
+//     const rewardPoolBalance = await provider.connection.getBalance(
+//       rewardPoolAccountPDA
+//     );
+
+//     const feeReceivingBalance = await provider.connection.getBalance(
+//       feeReceivingContractAccountPDA
+//     );
+
+//     // Attempt to withdraw more than available balance
+//     try {
+//       await program.methods
+//         .withdrawFunds(
+//           new BN(rewardPoolBalance + 1_000_000), // Exceeds balance
+//           new BN(feeReceivingBalance + 1_000_000) // Exceeds balance
+//         )
+//         .accountsPartial({
+//           oracleContractState: oracleContractState.publicKey,
+//           adminAccount: admin.publicKey,
+//           rewardPoolAccount: rewardPoolAccountPDA,
+//           feeReceivingContractAccount: feeReceivingContractAccountPDA,
+//           systemProgram: web3.SystemProgram.programId,
+//         })
+//         .rpc();
+
+//       throw new Error(
+//         "Withdrawal of amount exceeding balance should fail, but withdrawal succeeded."
+//       );
+//     } catch (error) {
+//       const anchorError = anchor.AnchorError.parse(error.logs);
+//       if (anchorError) {
+//         assert.equal(
+//           anchorError.error.errorCode.code,
+//           "InsufficientFunds",
+//           "Should throw InsufficientFunds error"
+//         );
+//       } else {
+//         throw error;
+//       }
+//     }
+
+//     console.log(
+//       "Excessive withdrawal test passed: Withdrawal of amount exceeding balance was prevented."
+//     );
+//   });
+// });
+
+
+// describe("Reinitialization Prevention", () => {
+//   it("Prevents reinitialization of OracleContractState", async () => {
+//     // Attempt to reinitialize OracleContractState
+//     try {
+//       await program.methods
+//         .initialize()
+//         .accountsStrict({
+//           oracleContractState: oracleContractState.publicKey,
+//           contributorDataAccount: oracleContractState.publicKey, // Dummy account
+//           user: admin.publicKey,
+//           tempReportAccount: oracleContractState.publicKey, // Dummy account
+//           txidSubmissionCountsAccount: oracleContractState.publicKey, // Dummy account
+//           aggregatedConsensusDataAccount: oracleContractState.publicKey, // Dummy account
+//           systemProgram: web3.SystemProgram.programId,
+//         })
+//         .rpc();
+
+//       throw new Error(
+//         "Reinitialization of OracleContractState should fail, but succeeded."
+//       );
+//     } catch (error) {
+//       const anchorError = anchor.AnchorError.parse(error.logs);
+//       if (anchorError) {
+//         assert.equal(
+//           anchorError.error.errorCode.code,
+//           "AccountAlreadyInitialized",
+//           "Should throw AccountAlreadyInitialized error"
+//         );
+//       } else {
+//         throw error;
+//       }
+//     }
+
+//     console.log(
+//       "Reinitialization prevention test passed: Reinitialization of OracleContractState was prevented."
+//     );
+//   });
+
+//   it("Prevents reinitialization of PDAs", async () => {
+//     // Attempt to reinitialize ContributorDataAccount
+//     const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+//       [Buffer.from("contributor_data")],
+//       program.programId
+//     );
+
+//     try {
+//       await program.methods
+//         .initialize()
+//         .accountsStrict({
+//           oracleContractState: oracleContractState.publicKey, // Dummy account
+//           contributorDataAccount: contributorDataAccountPDA,
+//           user: admin.publicKey,
+//           tempReportAccount: oracleContractState.publicKey, // Dummy account
+//           txidSubmissionCountsAccount: oracleContractState.publicKey, // Dummy account
+//           aggregatedConsensusDataAccount: oracleContractState.publicKey, // Dummy account
+//           systemProgram: web3.SystemProgram.programId,
+//         })
+//         .rpc();
+
+//       throw new Error(
+//         "Reinitialization of ContributorDataAccount should fail, but succeeded."
+//       );
+//     } catch (error) {
+//       console.log(
+//         "Reinitialization of PDA prevented as expected."
+//       );
+//     }
+
+//     console.log(
+//       "Reinitialization prevention test passed: Reinitialization of PDAs was prevented."
+//     );
+//   });
+// });
+
+
 // After all tests
 after(async function () {
   console.log(`Total compute units used: ${totalComputeUnitsUsed}`);
   console.log(`Max account storage used: ${maxAccountStorageUsed} bytes`);
 });
 
-// Remaining tests to add:
-
-// Reallocation of Oracle State:
-
-//     Test the functionality that allows dynamic reallocation of space for various program accounts.
-//     Simulate conditions where accounts reach their initial capacity and require reallocation to accommodate additional data.
-//     Ensure that during reallocation, no data is lost or corrupted, and the program maintains its integrity and performance.
-
-// Withdrawal of Funds:
-
-//     Verify that the withdrawal functionality works correctly, allowing the admin to securely withdraw funds from the reward pool and fee-receiving contract.
-//     Test different withdrawal scenarios, including partial withdrawals and attempts to withdraw amounts exceeding the account balances.
-//     Implement security tests to ensure that only the authorized admin can perform withdrawal actions, protecting against unauthorized access or exploitation.
-//     Validate the correct transfer and balance adjustments post-withdrawal, ensuring the program's accounting is accurate.
-
-// Reinitialization Prevention:
-// This testing ensures that program-derived accounts (PDAs) are not susceptible to unintended reinitialization, which could reset or corrupt the stored state.
-// Implement tests to attempt reinitialization of various accounts, particularly PDAs like OracleContractState, RewardPoolAccount, FeeReceivingContractAccount, etc., and verify that these attempts fail.
-// Such tests safeguard against vulnerabilities where an attacker or erroneous operation might reset critical state data, impacting the program's integrity.
-
-// Contract Upgrade Path:
-// If your program design includes provisions for future upgrades (a common practice in blockchain applications for scalability, feature addition, or bug fixes), it's crucial to test the upgrade process.
-// Simulate contract upgrades to ensure that the new version of the program maintains continuity with the existing state. This includes verifying that data in various accounts is preserved and remains consistent post-upgrade.
-// This aspect of testing is vital for ensuring that future upgrades do not disrupt the ongoing operations or data integrity of your program.
-
-// Resource Utilization and Cost Analysis:
-// Solana programs consume resources like compute units, and transactions have associated costs. It's important to analyze and test these aspects to optimize performance and cost-efficiency.
-// Perform tests to measure the resource utilization of various functions, especially those that are computationally intensive or called frequently. This helps identify potential bottlenecks or inefficiencies.
-// Analyze transaction costs to ensure that they align with expectations and are manageable within the economic model of your application. This is particularly important for functions that users will call frequently.

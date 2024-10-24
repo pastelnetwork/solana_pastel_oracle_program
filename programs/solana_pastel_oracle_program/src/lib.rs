@@ -193,24 +193,27 @@ fn update_submission_count(
     // Get the current timestamp
     let current_timestamp = Clock::get()?.unix_timestamp as u32;
 
-    // Check if the txid already exists in the submission counts
-    if let Some(count) = txid_submission_counts_account
-        .submission_counts
-        .iter_mut()
-        .find(|c| c.txid == txid)
-    {
-        // Update the existing count
-        count.count += 1;
-        count.last_updated = current_timestamp;
-    } else {
-        // Insert a new count if the txid does not exist
-        txid_submission_counts_account
-            .submission_counts
-            .push(TxidSubmissionCount {
-                txid: txid.to_string(),
-                count: 1,
-                last_updated: current_timestamp,
-            });
+    let counts = &mut txid_submission_counts_account.submission_counts;
+
+    // Use binary search directly without sorting, assuming counts is always kept sorted
+    match counts.binary_search_by(|c| c.txid.as_str().cmp(txid)) {
+        Ok(index) => {
+            // Found the txid, update the count
+            let count = &mut counts[index];
+            count.count += 1;
+            count.last_updated = current_timestamp;
+        }
+        Err(index) => {
+            // Not found, insert at the position to keep the vector sorted
+            counts.insert(
+                index,
+                TxidSubmissionCount {
+                    txid: txid.to_string(),
+                    count: 1,
+                    last_updated: current_timestamp,
+                },
+            );
+        }
     }
 
     Ok(())
@@ -221,14 +224,7 @@ pub fn get_report_account_pda(
     txid: &str,
     contributor_reward_address: &Pubkey,
 ) -> (Pubkey, u8) {
-    msg!(
-        "get_report_account_pda: program_id: {}, txid: {}, contributor_reward_address: {}",
-        program_id,
-        txid,
-        contributor_reward_address
-    );
     let seed_hash = create_seed("pastel_tx_status_report", txid, contributor_reward_address);
-    msg!("get_report_account_pda: seed_hash: {:?}", seed_hash);
     Pubkey::find_program_address(&[seed_hash.as_ref()], program_id)
 }
 
@@ -236,21 +232,25 @@ fn get_aggregated_data<'a>(
     aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
     txid: &str,
 ) -> Option<&'a AggregatedConsensusData> {
-    aggregated_data_account
-        .consensus_data
-        .iter()
-        .find(|data| data.txid == txid)
+    let consensus_data = &aggregated_data_account.consensus_data;
+    match consensus_data.binary_search_by(|d| d.txid.as_str().cmp(txid)) {
+        Ok(index) => Some(&consensus_data[index]),
+        Err(_) => None,
+    }
 }
 
 fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
-    let consensus_status = aggregated_data
+    // Find the index of the maximum status weight
+    let (max_status_index, _) = aggregated_data
         .status_weights
         .iter()
         .enumerate()
-        .max_by_key(|&(_, weight)| weight)
-        .map(|(index, _)| usize_to_txid_status(index).unwrap_or(TxidStatus::Invalid))
+        .max_by_key(|&(_, &weight)| weight)
         .unwrap();
 
+    let consensus_status = usize_to_txid_status(max_status_index).unwrap_or(TxidStatus::Invalid);
+
+    // Find the hash with the maximum weight
     let consensus_hash = aggregated_data
         .hash_weights
         .iter()
@@ -262,20 +262,31 @@ fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, 
 }
 
 fn apply_bans(contributor: &mut Contributor, current_timestamp: u32, is_accurate: bool) {
-    if !is_accurate {
-        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN
-            && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0
-        {
-            contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
-            msg!("Contributor: {} is temporarily banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Ban expires on: {}", 
-            contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, TEMPORARY_BAN_THRESHOLD, contributor.ban_expiry);
-        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN
-            && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD
-        {
-            contributor.ban_expiry = u32::MAX;
-            msg!("Contributor: {} is permanently banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Removing from list of contributors!", 
-            contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, PERMANENT_BAN_THRESHOLD);
-        }
+    if is_accurate {
+        return; // No need to apply bans if the report is accurate
+    }
+
+    let failures = contributor.consensus_failures;
+    let total_submissions = contributor.total_reports_submitted;
+
+    if total_submissions >= CONTRIBUTIONS_FOR_PERMANENT_BAN
+        && failures >= PERMANENT_BAN_THRESHOLD
+    {
+        contributor.ban_expiry = u32::MAX;
+        msg!(
+            "Contributor: {} is permanently banned as of {}",
+            contributor.reward_address,
+            current_timestamp
+        );
+    } else if total_submissions >= CONTRIBUTIONS_FOR_TEMPORARY_BAN
+        && failures % TEMPORARY_BAN_THRESHOLD == 0
+    {
+        contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
+        msg!(
+            "Contributor: {} is temporarily banned until {}",
+            contributor.reward_address,
+            contributor.ban_expiry
+        );
     }
 }
 
@@ -373,46 +384,38 @@ fn log_score_updates(contributor: &Contributor) {
 }
 
 fn update_statuses(contributor: &mut Contributor, current_timestamp: u32) {
-    // Updating recently active status
     let recent_activity_threshold = 86_400; // 24 hours in seconds
     contributor.is_recently_active =
-        current_timestamp - contributor.last_active_timestamp < recent_activity_threshold;
+        current_timestamp.saturating_sub(contributor.last_active_timestamp) < recent_activity_threshold;
 
-    // Updating reliability status
-    contributor.is_reliable = if contributor.total_reports_submitted > 0 {
-        let reliability_ratio = contributor
-            .accurate_reports_count
-            .to_fixed_giga()
-            .div_up(contributor.total_reports_submitted.to_fixed_giga());
-        reliability_ratio >= RELIABILITY_RATIO_THRESHOLD // Example threshold for reliability
+    let reliability_ratio = if contributor.total_reports_submitted > 0 {
+        (contributor.accurate_reports_count as u64 * ONE)
+            / (contributor.total_reports_submitted as u64)
     } else {
-        false
+        0
     };
 
-    // Updating eligibility for rewards
-    contributor.is_eligible_for_rewards = contributor.total_reports_submitted
-        >= MIN_REPORTS_FOR_REWARD
-        && contributor.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD
-        && contributor.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
+    contributor.is_reliable = reliability_ratio >= RELIABILITY_RATIO_THRESHOLD;
+    contributor.is_eligible_for_rewards = contributor.calculate_is_eligible_for_rewards();
 }
 
 fn update_contributor(contributor: &mut Contributor, current_timestamp: u32, is_accurate: bool) {
-    // Check if the contributor is banned before proceeding. If so, just return.
+    // Skip update if the contributor is banned
     if contributor.calculate_is_banned(current_timestamp) {
         msg!(
             "Contributor is currently banned and cannot be updated: {}",
             contributor.reward_address
         );
-        return; // We don't stop the process here, just skip this contributor.
+        return;
     }
 
-    // Updating scores
+    // Update scores
     update_scores(contributor, current_timestamp, is_accurate);
 
-    // Applying bans based on report accuracy
+    // Apply bans based on report accuracy
     apply_bans(contributor, current_timestamp, is_accurate);
 
-    // Updating contributor statuses
+    // Update contributor statuses
     update_statuses(contributor, current_timestamp);
 }
 
@@ -430,26 +433,37 @@ fn calculate_consensus(
     let mut updated_contributors = Vec::new();
     let mut contributor_count = 0;
 
-    for temp_report in temp_report_account.reports.iter() {
+    for temp_report in &temp_report_account.reports {
         let common_data = &temp_report_account.common_reports[temp_report.common_data_ref as usize];
         let specific_data = &temp_report.specific_data;
 
         if common_data.txid == txid
             && !updated_contributors.contains(&specific_data.contributor_reward_address)
         {
-            if let Some(contributor) = contributor_data_account
-                .contributors
-                .iter_mut()
-                .find(|c| c.reward_address == specific_data.contributor_reward_address)
-            {
-                let is_accurate = common_data.txid_status == consensus_status
-                    && common_data
-                        .first_6_characters_of_sha3_256_hash_of_corresponding_file
-                        .as_ref()
-                        .map_or(false, |hash| hash == &consensus_hash);
-                update_contributor(contributor, current_timestamp, is_accurate);
-                updated_contributors.push(specific_data.contributor_reward_address);
+            let contributors = &mut contributor_data_account.contributors;
+
+            // Use binary search directly without sorting
+            match contributors.binary_search_by(|c| c.reward_address.cmp(&specific_data.contributor_reward_address)) {
+                Ok(index) => {
+                    let contributor = &mut contributors[index];
+                    let is_accurate = common_data.txid_status == consensus_status
+                        && common_data
+                            .first_6_characters_of_sha3_256_hash_of_corresponding_file
+                            .as_ref()
+                            .map_or(false, |hash| hash == &consensus_hash);
+                    update_contributor(contributor, current_timestamp, is_accurate);
+                }
+                Err(_) => {
+                    // Contributor not found; this should not happen
+                    msg!(
+                        "Contributor not found: {}",
+                        specific_data.contributor_reward_address
+                    );
+                    return Err(OracleError::ContributorNotRegistered.into());
+                }
             }
+
+            updated_contributors.push(specific_data.contributor_reward_address);
             contributor_count += 1;
         }
     }
@@ -459,22 +473,19 @@ fn calculate_consensus(
 }
 
 pub fn apply_permanent_bans(contributor_data_account: &mut Account<ContributorDataAccount>) {
-    // Collect addresses of contributors to be removed for efficient logging
-    let contributors_to_remove: Vec<String> = contributor_data_account
-        .contributors
-        .iter()
-        .filter(|c| c.ban_expiry == u32::MAX)
-        .map(|c| c.reward_address.to_string()) // Convert Pubkey to String
-        .collect();
-
-    // Log information about the removal process
-    msg!("Now removing permanently banned contributors! Total number of contributors before removal: {}, Number of contributors to be removed: {}, Addresses of contributors to be removed: {:?}",
-        contributor_data_account.contributors.len(), contributors_to_remove.len(), contributors_to_remove);
-
-    // Retain only contributors who are not permanently banned
+    let initial_len = contributor_data_account.contributors.len();
     contributor_data_account
         .contributors
         .retain(|c| c.ban_expiry != u32::MAX);
+
+    let removed_count = initial_len - contributor_data_account.contributors.len();
+    if removed_count > 0 {
+        msg!(
+            "Removed {} permanently banned contributors. Total contributors now: {}",
+            removed_count,
+            contributor_data_account.contributors.len()
+        );
+    }
 }
 
 fn post_consensus_tasks(
@@ -523,43 +534,44 @@ fn aggregate_consensus_data(
     let scaled_weight = weight * 100; // Scaling by a factor of 100
     let current_timestamp = Clock::get()?.unix_timestamp as u32;
 
-    // Check if the txid already exists in the aggregated consensus data
-    if let Some(data_entry) = aggregated_data_account
-        .consensus_data
-        .iter_mut()
-        .find(|d| d.txid == txid)
-    {
-        // Update existing data
-        data_entry.status_weights[report.txid_status as usize] += scaled_weight;
-        if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            update_hash_weight(&mut data_entry.hash_weights, hash, scaled_weight);
-        }
-        data_entry.last_updated = current_timestamp;
-        // Handling the Option<String> here
-        data_entry.first_6_characters_of_sha3_256_hash_of_corresponding_file = report
-            .first_6_characters_of_sha3_256_hash_of_corresponding_file
-            .clone()
-            .unwrap_or_default();
-    } else {
-        // Create new data
-        let mut new_data = AggregatedConsensusData {
-            txid: txid.to_string(),
-            status_weights: [0; TXID_STATUS_VARIANT_COUNT],
-            hash_weights: Vec::new(),
-            first_6_characters_of_sha3_256_hash_of_corresponding_file: report
+    let consensus_data = &mut aggregated_data_account.consensus_data;
+
+    // Use binary search directly without sorting
+    match consensus_data.binary_search_by(|d| d.txid.as_str().cmp(txid)) {
+        Ok(index) => {
+            // Update existing data
+            let data_entry = &mut consensus_data[index];
+            data_entry.status_weights[report.txid_status as usize] += scaled_weight;
+            if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
+                update_hash_weight(&mut data_entry.hash_weights, hash, scaled_weight);
+            }
+            data_entry.last_updated = current_timestamp;
+            data_entry.first_6_characters_of_sha3_256_hash_of_corresponding_file = report
                 .first_6_characters_of_sha3_256_hash_of_corresponding_file
                 .clone()
-                .unwrap_or_default(),
-            last_updated: current_timestamp,
-        };
-        new_data.status_weights[report.txid_status as usize] += scaled_weight;
-        if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            new_data.hash_weights.push(HashWeight {
-                hash: hash.clone(),
-                weight: scaled_weight,
-            });
+                .unwrap_or_default();
         }
-        aggregated_data_account.consensus_data.push(new_data);
+        Err(index) => {
+            // Insert new data at the correct position to keep the vector sorted
+            let mut new_data = AggregatedConsensusData {
+                txid: txid.to_string(),
+                status_weights: [0; TXID_STATUS_VARIANT_COUNT],
+                hash_weights: Vec::new(),
+                first_6_characters_of_sha3_256_hash_of_corresponding_file: report
+                    .first_6_characters_of_sha3_256_hash_of_corresponding_file
+                    .clone()
+                    .unwrap_or_default(),
+                last_updated: current_timestamp,
+            };
+            new_data.status_weights[report.txid_status as usize] += scaled_weight;
+            if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
+                new_data.hash_weights.push(HashWeight {
+                    hash: hash.clone(),
+                    weight: scaled_weight,
+                });
+            }
+            consensus_data.insert(index, new_data);
+        }
     }
 
     Ok(())
@@ -569,16 +581,18 @@ fn find_or_add_common_report_data(
     temp_report_account: &mut TempTxStatusReportAccount,
     common_data: &CommonReportData,
 ) -> u64 {
-    if let Some((index, _)) = temp_report_account
+    // Use binary search directly without sorting
+    match temp_report_account
         .common_reports
-        .iter()
-        .enumerate()
-        .find(|(_, data)| *data == common_data)
+        .binary_search_by(|data| data.txid.cmp(&common_data.txid))
     {
-        index as u64
-    } else {
-        temp_report_account.common_reports.push(common_data.clone());
-        (temp_report_account.common_reports.len() - 1) as u64
+        Ok(index) => index as u64,
+        Err(index) => {
+            temp_report_account
+                .common_reports
+                .insert(index, common_data.clone());
+            index as u64
+        }
     }
 }
 
@@ -1055,21 +1069,12 @@ pub struct HashWeight {
     pub weight: u64,
 }
 
-// Function to update hash weight
 fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: u64) {
-    let mut found = false;
-
-    for hash_weight in hash_weights.iter_mut() {
-        if hash_weight.hash.as_str() == hash {
-            hash_weight.weight += weight;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
+    if let Some(hash_weight) = hash_weights.iter_mut().find(|hw| hw.hash == hash) {
+        hash_weight.weight += weight;
+    } else {
         hash_weights.push(HashWeight {
-            hash: hash.to_string(), // Clone only when necessary
+            hash: hash.to_string(),
             weight,
         });
     }
@@ -1184,28 +1189,21 @@ pub fn register_new_data_contributor_helper(
     ctx: Context<RegisterNewDataContributor>,
 ) -> Result<()> {
     let contributor_data_account = &mut ctx.accounts.contributor_data_account;
-    msg!(
-        "Initiating new contributor registration: {}",
-        ctx.accounts.contributor_account.key()
-    );
+    let reward_address = ctx.accounts.contributor_account.key();
 
-    // Check if the contributor is already registered
+    // Ensure the contributors list is sorted by reward_address
+    contributor_data_account
+        .contributors
+        .sort_by(|a, b| a.reward_address.cmp(&b.reward_address));
+
+    // Check if the contributor is already registered using binary search
     if contributor_data_account
         .contributors
-        .iter()
-        .any(|c| c.reward_address == *ctx.accounts.contributor_account.key)
+        .binary_search_by(|c| c.reward_address.cmp(&reward_address))
+        .is_ok()
     {
-        msg!(
-            "Registration failed: Contributor already registered: {}",
-            ctx.accounts.contributor_account.key
-        );
         return Err(OracleError::ContributorAlreadyRegistered.into());
     }
-
-    msg!(
-        "Registration fee verified. Attempting to register new contributor {}",
-        ctx.accounts.contributor_account.key
-    );
 
     // Deduct the registration fee from the fee_receiving_contract_account and add it to the reward pool account
     transfer(
@@ -1228,32 +1226,31 @@ pub fn register_new_data_contributor_helper(
 
     let last_active_timestamp = Clock::get()?.unix_timestamp as u32;
 
-    // Create and add the new contributor
     let new_contributor = Contributor {
-        reward_address: *ctx.accounts.contributor_account.key,
-        registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
-        compliance_score: ONE,                                          // Initial compliance score
-        last_active_timestamp, // Set the last active timestamp to the current time
-        total_reports_submitted: 0, // Initially, no reports have been submitted
-        accurate_reports_count: 0, // Initially, no accurate reports
-        current_streak: 0,     // No streak at the beginning
-        reliability_score: ONE, // Initial reliability score
-        consensus_failures: 0, // No consensus failures at the start
-        ban_expiry: 0,         // No ban initially set
-        is_eligible_for_rewards: false, // Initially not eligible for rewards
-        is_recently_active: false, // Initially not considered active
-        is_reliable: false,    // Initially not considered reliable
+        reward_address,
+        registration_entrance_fee_transaction_signature: String::new(),
+        compliance_score: ONE,
+        last_active_timestamp,
+        total_reports_submitted: 0,
+        accurate_reports_count: 0,
+        current_streak: 0,
+        reliability_score: ONE,
+        consensus_failures: 0,
+        ban_expiry: 0,
+        is_eligible_for_rewards: false,
+        is_recently_active: false,
+        is_reliable: false,
     };
 
-    // Append the new contributor to the ContributorDataAccount
-    contributor_data_account.contributors.push(new_contributor);
+    // Insert the new contributor at the correct position to keep the list sorted
+    match contributor_data_account
+        .contributors
+        .binary_search_by(|c| c.reward_address.cmp(&new_contributor.reward_address))
+    {
+        Ok(_) => {} // Should not happen since we checked earlier
+        Err(index) => contributor_data_account.contributors.insert(index, new_contributor),
+    }
 
-    // Logging for debug purposes
-    msg!(
-        "New Contributor successfully Registered: Address: {}, Timestamp: {}",
-        ctx.accounts.contributor_account.key,
-        last_active_timestamp
-    );
     Ok(())
 }
 
@@ -1329,36 +1326,34 @@ pub fn should_calculate_consensus(
     txid_submission_counts_account: &Account<TxidSubmissionCountsAccount>,
     txid: &str,
 ) -> Result<bool> {
-    // Retrieve the count of submissions and last updated timestamp for the given txid
-    let (submission_count, last_updated) = txid_submission_counts_account
-        .submission_counts
-        .iter()
-        .find(|c| c.txid == txid)
-        .map(|c| (c.count, c.last_updated))
-        .unwrap_or((0, 0));
-
-    // Check if the minimum threshold of reports is met
-    let min_threshold_met = submission_count >= MIN_NUMBER_OF_ORACLES as u32;
-
-    // Get the current unix timestamp from the Solana clock
     let current_unix_timestamp = Clock::get()?.unix_timestamp as u32;
 
-    // Check if N minutes have elapsed since the last update
-    let max_waiting_period_elapsed_for_txid = current_unix_timestamp - last_updated
-        >= MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS;
+    // Ensure the vector is sorted by txid
+    let counts = &txid_submission_counts_account.submission_counts;
+    match counts.binary_search_by(|c| c.txid.as_str().cmp(txid)) {
+        Ok(index) => {
+            let count = &counts[index];
+            let submission_count = count.count;
+            let last_updated = count.last_updated;
 
-    // Calculate consensus if minimum threshold is met or if N minutes have passed with at least MIN_NUMBER_OF_ORACLES reports
-    Ok(min_threshold_met
-        || (max_waiting_period_elapsed_for_txid
-            && submission_count >= MIN_NUMBER_OF_ORACLES as u32))
+            let min_threshold_met = submission_count >= MIN_NUMBER_OF_ORACLES as u32;
+            let time_elapsed = current_unix_timestamp.saturating_sub(last_updated);
+            let max_waiting_period_elapsed = time_elapsed >= MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_COMPUTING_CONSENSUS;
+
+            Ok(min_threshold_met || (max_waiting_period_elapsed && submission_count >= MIN_NUMBER_OF_ORACLES as u32))
+        }
+        Err(_) => Ok(false),
+    }
 }
 
-pub fn cleanup_old_submission_counts(state: &mut OracleContractState) -> Result<()> {
-    let current_time = Clock::get()?.unix_timestamp as u32;
-    state
-        .txid_submission_counts
-        .retain(|count| current_time - count.last_updated < SUBMISSION_COUNT_RETENTION_PERIOD);
-    Ok(())
+pub fn cleanup_old_submission_counts(
+    txid_submission_counts_account: &mut Account<TxidSubmissionCountsAccount>,
+    current_timestamp: u32,
+) {
+    let retention_period = SUBMISSION_COUNT_RETENTION_PERIOD;
+    txid_submission_counts_account
+        .submission_counts
+        .retain(|count| current_timestamp.saturating_sub(count.last_updated) < retention_period);
 }
 
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
