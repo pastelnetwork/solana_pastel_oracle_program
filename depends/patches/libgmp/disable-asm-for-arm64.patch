@@ -1,0 +1,13 @@
+--- configure.ac.orig
++++ configure.ac
+@@ -150,6 +150,10 @@
+   GMP_LDFLAGS="$GMP_LDFLAGS -Xlinker -m -Xlinker elf_x86_64"
+   ;;
+ esac
++
++case $host in
++  aarch64*) GMP_CFLAGS="$GMP_CFLAGS -DNO_ASM" ;;
++esac
+
+ AC_ARG_ENABLE(assembly,
+ [AS_HELP_STRING([--disable-assembly], [use generic C code instead of assembly])])

@@ -4,14 +4,13 @@
 //!
 //! ```rust
 //! use fixed::types::U34F30;
-//! use fixed_exp::FixedPowF;
+//! use solana_pastel_oracle_program::fixed_exp::FixedPowF;
 //!
 //! let x = U34F30::from_num(4.0);
 //! assert_eq!(U34F30::from_num(8.0), x.powf(U34F30::from_num(1.5)));
 //! ```
 
 use std::cmp::{Ord, Ordering};
-
 use fixed::traits::Fixed;
 use fixed::types::extra::{LeEqU128, LeEqU16, LeEqU32, LeEqU64, LeEqU8};
 use fixed::{
@@ -24,16 +23,6 @@ use typenum::{Bit, IsLessOrEqual, LeEq, True, U126, U127, U14, U15, U30, U31, U6
 /// Extension trait providing fixed-point exponentiation for fixed-point numbers.
 pub trait FixedPowF: Fixed {
     /// Raises a number to a fixed-point power.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use fixed::types::U34F30;
-    /// use fixed_exp::FixedPowF;
-    ///
-    /// let x = U34F30::from_num(4.0);
-    /// assert_eq!(U34F30::from_num(8.0), x.powf(U34F30::from_num(1.5)));
-    /// ```
     fn powf(self, n: Self) -> Self;
 }
 
@@ -272,7 +261,6 @@ impl_sign_helper!(unsigned, FixedU128, LeEqU128, U127);
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use fixed::types::U34F30;
 
     fn delta<T: Fixed>(a: T, b: T) -> T {
