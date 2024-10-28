@@ -220,6 +220,108 @@ describe("Initialization", () => {
   });
 });
 
+describe("Reinitialization Prevention", () => {
+  it("Prevents reinitialization of OracleContractState and all PDAs", async () => {
+    // Find all PDAs required for initialization
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reward_pool")],
+      program.programId
+    );
+    const [feeReceivingContractAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_receiving_contract")],
+      program.programId
+    );
+    const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("contributor_data")],
+      program.programId
+    );
+    const [txidSubmissionCountsAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("txid_submission_counts")],
+      program.programId
+    );
+    const [aggregatedConsensusDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("aggregated_consensus_data")],
+      program.programId
+    );
+    const [tempReportAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_tx_status_report")],
+      program.programId
+    );
+
+    try {
+      // Calculate the rent-exempt minimum balance for the account size
+      const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
+      
+      // Fund the oracleContractState account with enough SOL for rent exemption
+      const fundTx = new anchor.web3.Transaction().add(
+        anchor.web3.SystemProgram.transfer({
+          fromPubkey: admin.publicKey,
+          toPubkey: oracleContractState.publicKey,
+          lamports: minBalanceForRentExemption,
+        })
+      );
+      await provider.sendAndConfirm(fundTx);
+
+      // Attempt to reinitialize all accounts
+      const reinitTxSignature = await program.methods
+        .initialize()
+        .accountsStrict({
+          oracleContractState: oracleContractState.publicKey,
+          contributorDataAccount: contributorDataAccountPDA,
+          user: admin.publicKey,
+          tempReportAccount: tempReportAccountPDA,
+          txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
+          aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .signers([oracleContractState])
+        .rpc();
+
+      await measureComputeUnitsAndStorage(reinitTxSignature);
+      throw new Error("Reinitialization of OracleContractState and PDAs should fail");
+    } catch (error) {
+      if (error instanceof anchor.AnchorError) {
+        const anchorError = error as anchor.AnchorError;
+        assert.equal(
+          anchorError.error.errorCode.code,
+          "AccountAlreadyInitialized",
+          "Should throw AccountAlreadyInitialized error"
+        );
+        console.log("Successfully prevented reinitialization with correct error:", anchorError.error.errorMessage);
+      } else if (error.toString().includes("failed to send transaction")) {
+        // Handle case where transaction fails to send due to simulation error
+        console.log("Transaction simulation failed as expected due to initialization prevention");
+      } else if (error.logs && error.logs.some(log => 
+        log.includes("AccountAlreadyInitialized") || 
+        log.includes("already in use")
+      )) {
+        console.log("Successfully prevented reinitialization");
+      } else {
+        console.error("Unexpected error:", error);
+        throw error;
+      }
+    }
+
+    // Verify that the original initialization state remains unchanged
+    const state = await program.account.oracleContractState.fetch(
+      oracleContractState.publicKey
+    );
+    
+    assert.ok(
+      state.isInitialized,
+      "Oracle Contract State should still be initialized"
+    );
+    assert.equal(
+      state.adminPubkey.toString(),
+      admin.publicKey.toString(),
+      "Admin public key should remain unchanged"
+    );
+
+    // Log test completion
+    console.log("Reinitialization prevention test completed successfully");
+  });
+});
+
 describe("Set Bridge Contract", () => {
   it("Sets the bridge contract address to admin address", async () => {
     const setBridgeTxSignature = await program.methods
@@ -558,10 +660,10 @@ describe("Contributor Registration", () => {
   });
 });
 
-describe("TXID Monitoring", () => {
-  it("Adds multiple TXIDs for monitoring", async () => {
-    // Define the number of TXIDs to add for monitoring
+describe("TXID Monitoring and Verification", () => {
+  it("Adds and verifies multiple TXIDs for monitoring with parallel processing", async () => {
     const numTxids = NUMBER_OF_SIMULATED_REPORTS;
+    const BATCH_SIZE = 4; // Process TXIDs in batches of 4
 
     // Helper function to generate a random TXID
     const generateRandomTxid = () => {
@@ -570,125 +672,99 @@ describe("TXID Monitoring", () => {
         .join("");
     };
 
-    for (let i = 0; i < numTxids; i++) {
-      const txid = generateRandomTxid();
+    // Generate all TXIDs upfront
+    const txids = Array(numTxids).fill(null).map(() => generateRandomTxid());
+    const expectedAmountLamports = COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING * web3.LAMPORTS_PER_SOL;
+    const expectedAmountStr = expectedAmountLamports.toString();
 
-      const expectedAmountLamports =
-        COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING *
-        web3.LAMPORTS_PER_SOL;
-      const expectedAmountStr = expectedAmountLamports.toString();
+    // Process TXIDs in parallel batches
+    for (let i = 0; i < txids.length; i += BATCH_SIZE) {
+      const currentBatch = txids.slice(i, i + BATCH_SIZE);
+      
+      // Process batch in parallel
+      await Promise.all(currentBatch.map(async (txid) => {
+        // Create PDA for pending payment account
+        const preimageString = "pending_payment" + txid + admin.publicKey.toBase58();
+        const preimageBytes = Buffer.from(preimageString, "utf8");
+        const seedHash = crypto.createHash("sha256").update(preimageBytes).digest();
+        const [pendingPaymentAccountPDA] = web3.PublicKey.findProgramAddressSync(
+          [seedHash],
+          program.programId
+        );
 
-      const preimageString =
-        "pending_payment" + txid + admin.publicKey.toBase58();
-      const preimageBytes = Buffer.from(preimageString, "utf8");
-      const seedHash = crypto
-        .createHash("sha256")
-        .update(preimageBytes)
-        .digest();
-      const [pendingPaymentAccountPDA] = web3.PublicKey.findProgramAddressSync(
-        [seedHash],
-        program.programId
-      );
+        // Add pending payment
+        const addPendingPaymentTxSignature = await program.methods
+          .addPendingPayment(txid, new BN(expectedAmountStr), { pending: {} })
+          .accountsPartial({
+            pendingPaymentAccount: pendingPaymentAccountPDA,
+            oracleContractState: oracleContractState.publicKey,
+            user: admin.publicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .rpc();
+        await measureComputeUnitsAndStorage(addPendingPaymentTxSignature);
 
-      const addPendingPaymentTxSignature = await program.methods
-        .addPendingPayment(txid, new BN(expectedAmountStr), { pending: {} })
-        .accountsPartial({
-          pendingPaymentAccount: pendingPaymentAccountPDA,
-          oracleContractState: oracleContractState.publicKey,
-          user: admin.publicKey,
-          systemProgram: web3.SystemProgram.programId,
-        })
-        .rpc();
-      await measureComputeUnitsAndStorage(addPendingPaymentTxSignature);
+        // Add TXID for monitoring
+        const addTxidTxSignature = await program.methods
+          .addTxidForMonitoring({ txid: txid })
+          .accountsPartial({
+            oracleContractState: oracleContractState.publicKey,
+            caller: admin.publicKey,
+            pendingPaymentAccount: pendingPaymentAccountPDA,
+            user: admin.publicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .rpc();
+        await measureComputeUnitsAndStorage(addTxidTxSignature);
 
-      const addTxidTxSignature = await program.methods
-        .addTxidForMonitoring({ txid: txid })
-        .accountsPartial({
-          oracleContractState: oracleContractState.publicKey,
-          caller: admin.publicKey,
-          pendingPaymentAccount: pendingPaymentAccountPDA,
-          user: admin.publicKey,
-          systemProgram: web3.SystemProgram.programId,
-        })
-        .rpc();
-      await measureComputeUnitsAndStorage(addTxidTxSignature);
-
-      // Fetch the updated state
-      const state = await program.account.oracleContractState.fetch(
-        oracleContractState.publicKey
-      );
-      const pendingPaymentData =
-        await program.account.pendingPaymentAccount.fetch(
+        // Immediately verify the pending payment account
+        const pendingPaymentData = await program.account.pendingPaymentAccount.fetch(
           pendingPaymentAccountPDA
         );
 
-      // Assertions for each TXID
-      assert(
-        state.monitoredTxids.includes(txid),
-        `The TXID ${txid} should be added to the monitored list`
-      );
-      assert.strictEqual(
-        pendingPaymentData.pendingPayment.expectedAmount.toNumber(),
-        expectedAmountLamports,
-        `The expected amount for pending payment for TXID ${txid} should match`
-      );
-      console.log(`TXID ${txid} successfully added for monitoring`);
-    }
-  });
-});
+        // Verify pending payment data
+        assert.strictEqual(
+          pendingPaymentData.pendingPayment.txid,
+          txid,
+          `The TXID in PendingPayment should match the monitored TXID: ${txid}`
+        );
+        
+        assert.strictEqual(
+          pendingPaymentData.pendingPayment.expectedAmount.toNumber(),
+          expectedAmountLamports,
+          `The expected amount in PendingPayment should match for TXID: ${txid}`
+        );
 
-describe("TXID Monitoring Verification", () => {
-  it("Verifies all monitored TXIDs have corresponding PendingPayment structs", async () => {
-    // Fetch monitored TXIDs from the updated state
+        const paymentStatusJson = JSON.stringify(pendingPaymentData.pendingPayment.paymentStatus);
+        assert.strictEqual(
+          paymentStatusJson,
+          JSON.stringify({ pending: {} }),
+          `The payment status for TXID: ${txid} should be 'Pending'`
+        );
+
+        console.log(`TXID ${txid} added and verified successfully`);
+      }));
+
+      // Optional: Add a small delay between batches to prevent rate limiting
+      if (i + BATCH_SIZE < txids.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    // Final verification of all TXIDs in oracle contract state
     const state = await program.account.oracleContractState.fetch(
       oracleContractState.publicKey
     );
-    const monitoredTxids = state.monitoredTxids;
 
-    for (const txid of monitoredTxids) {
-      // Derive the PDA for each PendingPaymentAccount
-      const preimageString =
-        "pending_payment" + txid + admin.publicKey.toBase58();
-      const preimageBytes = Buffer.from(preimageString, "utf8");
-      const seedHash = crypto
-        .createHash("sha256")
-        .update(preimageBytes)
-        .digest();
-      const [pendingPaymentAccountPDA] = web3.PublicKey.findProgramAddressSync(
-        [seedHash],
-        program.programId
+    // Verify all TXIDs are in the monitored list
+    txids.forEach(txid => {
+      assert(
+        state.monitoredTxids.includes(txid),
+        `TXID ${txid} should be in the monitored list`
       );
+    });
 
-      // Fetch the PendingPayment struct for each TXID
-      const pendingPaymentData =
-        await program.account.pendingPaymentAccount.fetch(
-          pendingPaymentAccountPDA
-        );
-
-      // Assertions to verify the PendingPayment struct is correctly initialized
-      assert.strictEqual(
-        pendingPaymentData.pendingPayment.txid,
-        txid,
-        `The TXID in PendingPayment should match the monitored TXID: ${txid}`
-      );
-      assert.strictEqual(
-        pendingPaymentData.pendingPayment.expectedAmount.toNumber(),
-        COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING *
-          web3.LAMPORTS_PER_SOL,
-        `The expected amount in PendingPayment should match for TXID: ${txid}`
-      );
-
-      // Convert paymentStatus to JSON and compare the stringified version
-      const paymentStatusJson = JSON.stringify(
-        pendingPaymentData.pendingPayment.paymentStatus
-      );
-      assert.strictEqual(
-        paymentStatusJson,
-        JSON.stringify({ pending: {} }),
-        `The payment status for TXID: ${txid} should be 'Pending'`
-      );
-      console.log(`Verified PendingPayment struct for monitored TXID: ${txid}`);
-    }
+    console.log(`Successfully added and verified ${numTxids} TXIDs`);
   });
 });
 
@@ -1490,6 +1566,217 @@ describe("Reallocation of Oracle State", () => {
       contributorData.contributors.length >= contributorsToAdd,
       "All contributors should be registered after reallocation"
     );
+  });
+});
+
+describe("Withdrawal of Funds", () => {
+  it("Allows admin to withdraw funds from reward pool and fee-receiving contract", async () => {
+    // Find PDAs for accounts
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reward_pool")],
+      program.programId
+    );
+
+    const [feeReceivingContractAccountPDA] =
+      web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("fee_receiving_contract")],
+        program.programId
+      );
+
+    // Fund the rewardPoolAccount PDA with 1 SOL for testing
+    const fundingAmount = web3.LAMPORTS_PER_SOL; // 1 SOL
+    const fundRewardPoolTx = new web3.Transaction().add(
+      web3.SystemProgram.transfer({
+        fromPubkey: admin.publicKey,
+        toPubkey: rewardPoolAccountPDA,
+        lamports: fundingAmount,
+      })
+    );
+
+    const fundRewardPoolTxSignature = await provider.sendAndConfirm(
+      fundRewardPoolTx
+    );
+    await measureComputeUnitsAndStorage(fundRewardPoolTxSignature);
+    console.log(
+      `Funded reward_pool_account PDA with ${fundingAmount} lamports`
+    );
+
+    // Fund the fee receiving contract for testing
+    const fundFeeReceivingTx = new web3.Transaction().add(
+      web3.SystemProgram.transfer({
+        fromPubkey: admin.publicKey,
+        toPubkey: feeReceivingContractAccountPDA,
+        lamports: fundingAmount,
+      })
+    );
+
+    const fundFeeReceivingTxSignature = await provider.sendAndConfirm(
+      fundFeeReceivingTx
+    );
+    await measureComputeUnitsAndStorage(fundFeeReceivingTxSignature);
+    console.log(
+      `Funded fee_receiving_contract PDA with ${fundingAmount} lamports`
+    );
+
+    // Wait for funding transactions to be confirmed
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Get initial balances
+    const initialRewardPoolBalance = await provider.connection.getBalance(
+      rewardPoolAccountPDA
+    );
+    const initialFeeReceivingBalance = await provider.connection.getBalance(
+      feeReceivingContractAccountPDA
+    );
+    const initialAdminBalance = await provider.connection.getBalance(
+      admin.publicKey
+    );
+
+    console.log(`Initial reward pool balance: ${initialRewardPoolBalance}`);
+    console.log(`Initial fee receiving balance: ${initialFeeReceivingBalance}`);
+    console.log(`Initial admin balance: ${initialAdminBalance}`);
+
+    // Define withdrawal amounts as half of initial balances
+    const rewardPoolWithdrawalAmount = Math.floor(initialRewardPoolBalance / 2);
+    const feeReceivingWithdrawalAmount = Math.floor(
+      initialFeeReceivingBalance / 2
+    );
+
+    try {
+      // Withdraw funds
+      const withdrawFundsTxSignature = await program.methods
+        .withdrawFunds(
+          new BN(rewardPoolWithdrawalAmount),
+          new BN(feeReceivingWithdrawalAmount)
+        )
+        .accountsStrict({
+          oracleContractState: oracleContractState.publicKey,
+          adminAccount: admin.publicKey,
+          rewardPoolAccount: rewardPoolAccountPDA,
+          feeReceivingContractAccount: feeReceivingContractAccountPDA,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      await measureComputeUnitsAndStorage(withdrawFundsTxSignature);
+
+      console.log("Withdrawal transaction completed successfully");
+    } catch (error) {
+      console.error("Error during withdrawal:", error);
+      throw error;
+    }
+
+    // Wait for the withdrawal transaction to be confirmed
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Get updated balances
+    const updatedRewardPoolBalance = await provider.connection.getBalance(
+      rewardPoolAccountPDA
+    );
+    const updatedFeeReceivingBalance = await provider.connection.getBalance(
+      feeReceivingContractAccountPDA
+    );
+    const updatedAdminBalance = await provider.connection.getBalance(
+      admin.publicKey
+    );
+
+    console.log(`Updated reward pool balance: ${updatedRewardPoolBalance}`);
+    console.log(`Updated fee receiving balance: ${updatedFeeReceivingBalance}`);
+    console.log(`Updated admin balance: ${updatedAdminBalance}`);
+
+    // Calculate the expected total withdrawal amount
+    const expectedTotalWithdrawal =
+      rewardPoolWithdrawalAmount + feeReceivingWithdrawalAmount;
+
+    // Calculate the actual withdrawal amount, accounting for transaction fees
+    const actualWithdrawal = updatedAdminBalance - initialAdminBalance;
+
+    // Allow for a small margin due to transaction fees
+    const margin = 10_000;
+
+    // Assertions with detailed error messages
+    assert(
+      Math.abs(actualWithdrawal - expectedTotalWithdrawal) <= margin,
+      `Admin balance should increase by approximately ${expectedTotalWithdrawal} lamports (allowing for transaction fees), but increased by ${actualWithdrawal} lamports`
+    );
+
+    assert.equal(
+      updatedRewardPoolBalance,
+      initialRewardPoolBalance - rewardPoolWithdrawalAmount,
+      `Reward pool balance should decrease by exactly ${rewardPoolWithdrawalAmount} lamports`
+    );
+
+    assert.equal(
+      updatedFeeReceivingBalance,
+      initialFeeReceivingBalance - feeReceivingWithdrawalAmount,
+      `Fee receiving contract balance should decrease by exactly ${feeReceivingWithdrawalAmount} lamports`
+    );
+
+    console.log(`
+      Withdrawal test summary:
+      - Reward pool withdrawal: ${rewardPoolWithdrawalAmount} lamports
+      - Fee receiving withdrawal: ${feeReceivingWithdrawalAmount} lamports
+      - Total withdrawal: ${expectedTotalWithdrawal} lamports
+      - Actual admin balance increase: ${actualWithdrawal} lamports
+      Test completed successfully!
+    `);
+  });
+
+  it("Should not allow non-admin to withdraw funds", async () => {
+    // Create a non-admin keypair
+    const nonAdmin = web3.Keypair.generate();
+
+    // Fund the non-admin account with some SOL for transaction fees
+    const fundTx = new web3.Transaction().add(
+      web3.SystemProgram.transfer({
+        fromPubkey: admin.publicKey,
+        toPubkey: nonAdmin.publicKey,
+        lamports: web3.LAMPORTS_PER_SOL * 0.1, // 0.1 SOL
+      })
+    );
+
+    const fundTxSignature = await provider.sendAndConfirm(fundTx);
+    await measureComputeUnitsAndStorage(fundTxSignature);
+
+    // Find PDAs
+    const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reward_pool")],
+      program.programId
+    );
+
+    const [feeReceivingContractAccountPDA] =
+      web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("fee_receiving_contract")],
+        program.programId
+      );
+
+    try {
+      // Attempt to withdraw funds as non-admin
+      await program.methods
+        .withdrawFunds(new BN(1000000), new BN(1000000))
+        .accountsStrict({
+          oracleContractState: oracleContractState.publicKey,
+          adminAccount: nonAdmin.publicKey,
+          rewardPoolAccount: rewardPoolAccountPDA,
+          feeReceivingContractAccount: feeReceivingContractAccountPDA,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([nonAdmin])
+        .rpc();
+
+      assert.fail("Transaction should have failed for non-admin");
+    } catch (error) {
+      const anchorError = anchor.AnchorError.parse(error.logs);
+      if (anchorError) {
+        assert.equal(
+          anchorError.error.errorCode.code,
+          "UnauthorizedWithdrawalAccount",
+          "Should throw UnauthorizedWithdrawalAccount error"
+        );
+        console.log("Non-admin withdrawal correctly rejected");
+      } else {
+        throw error;
+      }
+    }
   });
 });
 
