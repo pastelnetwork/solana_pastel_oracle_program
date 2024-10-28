@@ -6,7 +6,9 @@ use crate::fixed_giga::*;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::{hash, Hash};
 use anchor_lang::solana_program::sysvar::clock::Clock;
+use anchor_lang::solana_program::sysvar::rent::Rent;
 use anchor_lang::system_program::{transfer, Transfer};
+use anchor_lang::solana_program::{program::invoke, system_instruction};
 
 const REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS: u64 = 10_000_000; // 0.10 SOL in lamports
 const MIN_NUMBER_OF_ORACLES: usize = 8; // Minimum number of oracles to calculate consensus
@@ -60,6 +62,8 @@ pub enum OracleError {
     ContributorNotRegistered,
     ContributorBanned,
     EnoughReportsSubmittedForTxid,
+    MaxSizeExceeded,
+    InvalidAccountName,
 }
 
 pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> Hash {
@@ -602,6 +606,7 @@ pub fn submit_data_report_helper(
     report: PastelTxStatusReport,
     contributor_reward_address: Pubkey,
 ) -> Result<()> {
+
     // Directly access accounts from the context
     let txid_submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount> =
         &mut ctx.accounts.txid_submission_counts_account;
@@ -909,156 +914,412 @@ impl<'info> Initialize<'info> {
     }
 }
 
-#[derive(Accounts)]
-pub struct ReallocateOracleState<'info> {
-    #[account(mut, has_one = admin_pubkey)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-    pub admin_pubkey: Signer<'info>,
-    pub system_program: Program<'info, System>,
-    #[account(mut)]
-    pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
-    #[account(mut)]
-    pub contributor_data_account: Account<'info, ContributorDataAccount>,
-    #[account(mut)]
-    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
-    #[account(mut)]
-    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
-}
-
-pub fn reallocate_temp_report_account(
-    temp_report_account: &mut Account<'_, TempTxStatusReportAccount>,
+fn reallocate_temp_report_account<'info>(
+    temp_report_account: &mut Account<'info, TempTxStatusReportAccount>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
     const REALLOCATION_THRESHOLD: f32 = 0.9;
     const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
+    const MAX_SIZE: usize = 100 * 1024; // 100KB
 
     let current_size = temp_report_account.to_account_info().data_len();
-    let current_usage =
-        temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>();
+    let current_usage = temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>();
     let usage_ratio = current_usage as f32 / current_size as f32;
 
     if usage_ratio > REALLOCATION_THRESHOLD {
         let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        temp_report_account
-            .to_account_info()
-            .realloc(new_size, false)?;
+
+        // Prevent reallocating beyond MAX_SIZE
+        if new_size > MAX_SIZE {
+            msg!(
+                "Cannot reallocate TempTxStatusReportAccount beyond MAX_SIZE of {} bytes.",
+                MAX_SIZE
+            );
+            return Err(OracleError::MaxSizeExceeded.into());
+        }
+
+        // Attempt to reallocate
+        temp_report_account.to_account_info().realloc(new_size, false)?;
         msg!(
-            "TempTxStatusReportAccount reallocated to new size: {}",
+            "TempTxStatusReportAccount reallocated from {} bytes to {} bytes.",
+            current_size,
             new_size
+        );
+
+        // Calculate new rent minimum
+        let rent = Rent::get()?;
+        let new_rent_minimum = rent.minimum_balance(new_size);
+        let current_lamports = temp_report_account.to_account_info().lamports();
+        let lamports_needed = new_rent_minimum.saturating_sub(current_lamports);
+
+        if lamports_needed > 0 {
+            // Transfer lamports from payer to the account to meet rent exemption
+            invoke(
+                &system_instruction::transfer(
+                    payer.key,
+                    temp_report_account.to_account_info().key,
+                    lamports_needed,
+                ),
+                &[
+                    payer.clone(),
+                    temp_report_account.to_account_info().clone(),
+                    system_program.clone(),
+                ],
+            )?;
+            msg!(
+                "Transferred {} lamports from payer to TempTxStatusReportAccount to meet rent-exemption.",
+                lamports_needed
+            );
+        }
+
+        // Verify rent-exemption
+        let updated_lamports = temp_report_account.to_account_info().lamports();
+        let is_rent_exempt = rent.is_exempt(updated_lamports, new_size);
+        if !is_rent_exempt {
+            msg!(
+                "TempTxStatusReportAccount is not rent-exempt after reallocation. Required: {}, Current: {}",
+                new_rent_minimum,
+                updated_lamports
+            );
+            return Err(OracleError::InsufficientFunds.into());
+        }
+
+        msg!(
+            "TempTxStatusReportAccount is now rent-exempt with a size of {} bytes.",
+            new_size
+        );
+    } else {
+        msg!(
+            "TempTxStatusReportAccount usage ratio ({:.2}) is below the reallocation threshold ({})",
+            usage_ratio,
+            REALLOCATION_THRESHOLD
         );
     }
 
     Ok(())
 }
 
-pub fn reallocate_contributor_data_account(
-    contributor_data_account: &mut Account<'_, ContributorDataAccount>,
+fn reallocate_contributor_data_account<'info>(
+    contributor_data_account: &mut Account<'info, ContributorDataAccount>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
     const REALLOCATION_THRESHOLD: f32 = 0.9;
     const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
+    const MAX_SIZE: usize = 100 * 1024; // 100KB
 
     let current_size = contributor_data_account.to_account_info().data_len();
-    let current_usage =
-        contributor_data_account.contributors.len() * std::mem::size_of::<Contributor>();
+    let current_usage = contributor_data_account.contributors.len() * std::mem::size_of::<Contributor>();
     let usage_ratio = current_usage as f32 / current_size as f32;
 
     if usage_ratio > REALLOCATION_THRESHOLD {
         let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        contributor_data_account
-            .to_account_info()
-            .realloc(new_size, false)?;
+
+        // Prevent reallocating beyond MAX_SIZE
+        if new_size > MAX_SIZE {
+            msg!(
+                "Cannot reallocate ContributorDataAccount beyond MAX_SIZE of {} bytes.",
+                MAX_SIZE
+            );
+            return Err(OracleError::MaxSizeExceeded.into());
+        }
+
+        // Attempt to reallocate
+        contributor_data_account.to_account_info().realloc(new_size, false)?;
         msg!(
-            "ContributorDataAccount reallocated to new size: {}",
+            "ContributorDataAccount reallocated from {} bytes to {} bytes.",
+            current_size,
             new_size
+        );
+
+        // Calculate new rent minimum
+        let rent = Rent::get()?;
+        let new_rent_minimum = rent.minimum_balance(new_size);
+        let current_lamports = contributor_data_account.to_account_info().lamports();
+        let lamports_needed = new_rent_minimum.saturating_sub(current_lamports);
+
+        if lamports_needed > 0 {
+            // Transfer lamports from payer to the account to meet rent exemption
+            invoke(
+                &system_instruction::transfer(
+                    payer.key,
+                    contributor_data_account.to_account_info().key,
+                    lamports_needed,
+                ),
+                &[
+                    payer.clone(),
+                    contributor_data_account.to_account_info().clone(),
+                    system_program.clone(),
+                ],
+            )?;
+            msg!(
+                "Transferred {} lamports from payer to ContributorDataAccount to meet rent-exemption.",
+                lamports_needed
+            );
+        }
+
+        // Verify rent-exemption
+        let updated_lamports = contributor_data_account.to_account_info().lamports();
+        let is_rent_exempt = rent.is_exempt(updated_lamports, new_size);
+        if !is_rent_exempt {
+            msg!(
+                "ContributorDataAccount is not rent-exempt after reallocation. Required: {}, Current: {}",
+                new_rent_minimum,
+                updated_lamports
+            );
+            return Err(OracleError::InsufficientFunds.into());
+        }
+
+        msg!(
+            "ContributorDataAccount is now rent-exempt with a size of {} bytes.",
+            new_size
+        );
+    } else {
+        msg!(
+            "ContributorDataAccount usage ratio ({:.2}) is below the reallocation threshold ({})",
+            usage_ratio,
+            REALLOCATION_THRESHOLD
         );
     }
 
     Ok(())
 }
 
-pub fn reallocate_submission_counts_account(
-    submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount>,
+fn reallocate_submission_counts_account<'info>(
+    submission_counts_account: &mut Account<'info, TxidSubmissionCountsAccount>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
     const REALLOCATION_THRESHOLD: f32 = 0.9;
     const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
+    const MAX_SIZE: usize = 100 * 1024; // 100KB
 
     let current_size = submission_counts_account.to_account_info().data_len();
-    let current_usage = submission_counts_account.submission_counts.len()
+    let current_usage = submission_counts_account
+        .submission_counts
+        .len()
         * std::mem::size_of::<TxidSubmissionCount>();
     let usage_ratio = current_usage as f32 / current_size as f32;
 
     if usage_ratio > REALLOCATION_THRESHOLD {
         let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        submission_counts_account
-            .to_account_info()
-            .realloc(new_size, false)?;
+
+        // Prevent reallocating beyond MAX_SIZE
+        if new_size > MAX_SIZE {
+            msg!(
+                "Cannot reallocate TxidSubmissionCountsAccount beyond MAX_SIZE of {} bytes.",
+                MAX_SIZE
+            );
+            return Err(OracleError::MaxSizeExceeded.into());
+        }
+
+        // Attempt to reallocate
+        submission_counts_account.to_account_info().realloc(new_size, false)?;
         msg!(
-            "TxidSubmissionCountsAccount reallocated to new size: {}",
+            "TxidSubmissionCountsAccount reallocated from {} bytes to {} bytes.",
+            current_size,
             new_size
+        );
+
+        // Calculate new rent minimum
+        let rent = Rent::get()?;
+        let new_rent_minimum = rent.minimum_balance(new_size);
+        let current_lamports = submission_counts_account.to_account_info().lamports();
+        let lamports_needed = new_rent_minimum.saturating_sub(current_lamports);
+
+        if lamports_needed > 0 {
+            // Transfer lamports from payer to the account to meet rent exemption
+            invoke(
+                &system_instruction::transfer(
+                    payer.key,
+                    submission_counts_account.to_account_info().key,
+                    lamports_needed,
+                ),
+                &[
+                    payer.clone(),
+                    submission_counts_account.to_account_info().clone(),
+                    system_program.clone(),
+                ],
+            )?;
+            msg!(
+                "Transferred {} lamports from payer to TxidSubmissionCountsAccount to meet rent-exemption.",
+                lamports_needed
+            );
+        }
+
+        // Verify rent-exemption
+        let updated_lamports = submission_counts_account.to_account_info().lamports();
+        let is_rent_exempt = rent.is_exempt(updated_lamports, new_size);
+        if !is_rent_exempt {
+            msg!(
+                "TxidSubmissionCountsAccount is not rent-exempt after reallocation. Required: {}, Current: {}",
+                new_rent_minimum,
+                updated_lamports
+            );
+            return Err(OracleError::InsufficientFunds.into());
+        }
+
+        msg!(
+            "TxidSubmissionCountsAccount is now rent-exempt with a size of {} bytes.",
+            new_size
+        );
+    } else {
+        msg!(
+            "TxidSubmissionCountsAccount usage ratio ({:.2}) is below the reallocation threshold ({})",
+            usage_ratio,
+            REALLOCATION_THRESHOLD
         );
     }
 
     Ok(())
 }
 
-pub fn reallocate_aggregated_consensus_data_account(
-    aggregated_consensus_data_account: &mut Account<'_, AggregatedConsensusDataAccount>,
+fn reallocate_aggregated_consensus_data_account<'info>(
+    aggregated_consensus_data_account: &mut Account<'info, AggregatedConsensusDataAccount>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
     const REALLOCATION_THRESHOLD: f32 = 0.9;
     const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
+    const MAX_SIZE: usize = 100 * 1024; // 100KB
 
-    let current_size = aggregated_consensus_data_account
-        .to_account_info()
-        .data_len();
-    let current_usage = aggregated_consensus_data_account.consensus_data.len()
+    let current_size = aggregated_consensus_data_account.to_account_info().data_len();
+    let current_usage = aggregated_consensus_data_account
+        .consensus_data
+        .len()
         * std::mem::size_of::<AggregatedConsensusData>();
     let usage_ratio = current_usage as f32 / current_size as f32;
 
     if usage_ratio > REALLOCATION_THRESHOLD {
         let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        aggregated_consensus_data_account
-            .to_account_info()
-            .realloc(new_size, false)?;
+
+        // Prevent reallocating beyond MAX_SIZE
+        if new_size > MAX_SIZE {
+            msg!(
+                "Cannot reallocate AggregatedConsensusDataAccount beyond MAX_SIZE of {} bytes.",
+                MAX_SIZE
+            );
+            return Err(OracleError::MaxSizeExceeded.into());
+        }
+
+        // Attempt to reallocate
+        aggregated_consensus_data_account.to_account_info().realloc(new_size, false)?;
         msg!(
-            "AggregatedConsensusDataAccount reallocated to new size: {}",
+            "AggregatedConsensusDataAccount reallocated from {} bytes to {} bytes.",
+            current_size,
             new_size
+        );
+
+        // Calculate new rent minimum
+        let rent = Rent::get()?;
+        let new_rent_minimum = rent.minimum_balance(new_size);
+        let current_lamports = aggregated_consensus_data_account.to_account_info().lamports();
+        let lamports_needed = new_rent_minimum.saturating_sub(current_lamports);
+
+        if lamports_needed > 0 {
+            // Transfer lamports from payer to the account to meet rent exemption
+            invoke(
+                &system_instruction::transfer(
+                    payer.key,
+                    aggregated_consensus_data_account.to_account_info().key,
+                    lamports_needed,
+                ),
+                &[
+                    payer.clone(),
+                    aggregated_consensus_data_account.to_account_info().clone(),
+                    system_program.clone(),
+                ],
+            )?;
+            msg!(
+                "Transferred {} lamports from payer to AggregatedConsensusDataAccount to meet rent-exemption.",
+                lamports_needed
+            );
+        }
+
+        // Verify rent-exemption
+        let updated_lamports = aggregated_consensus_data_account.to_account_info().lamports();
+        let is_rent_exempt = rent.is_exempt(updated_lamports, new_size);
+        if !is_rent_exempt {
+            msg!(
+                "AggregatedConsensusDataAccount is not rent-exempt after reallocation. Required: {}, Current: {}",
+                new_rent_minimum,
+                updated_lamports
+            );
+            return Err(OracleError::InsufficientFunds.into());
+        }
+
+        msg!(
+            "AggregatedConsensusDataAccount is now rent-exempt with a size of {} bytes.",
+            new_size
+        );
+    } else {
+        msg!(
+            "AggregatedConsensusDataAccount usage ratio ({:.2}) is below the reallocation threshold ({})",
+            usage_ratio,
+            REALLOCATION_THRESHOLD
         );
     }
 
     Ok(())
 }
 
+#[derive(Accounts)]
+pub struct ReallocateOracleState<'info> {
+    #[account(mut, has_one = admin_pubkey)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+
+    pub admin_pubkey: Signer<'info>, // Admin is the payer
+
+    pub system_program: Program<'info, System>,
+
+    #[account(mut)]
+    pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
+
+    #[account(mut)]
+    pub contributor_data_account: Account<'info, ContributorDataAccount>,
+
+    #[account(mut)]
+    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
+
+    #[account(mut)]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+}
+
 impl<'info> ReallocateOracleState<'info> {
     pub fn execute(ctx: Context<ReallocateOracleState>) -> Result<()> {
-        let oracle_contract_state = &mut ctx.accounts.oracle_contract_state;
+        let payer = ctx.accounts.admin_pubkey.to_account_info(); // Admin is the payer
+        let system_program = ctx.accounts.system_program.to_account_info();
 
-        // Calculate new size; add 10,240 bytes for each reallocation
-        // Ensure not to exceed 100KB total size
-        let current_size = oracle_contract_state.to_account_info().data_len();
-        let additional_space = 10_240; // Increment size
-        let max_size = 100 * 1024; // 100KB
-        let new_size = std::cmp::min(current_size + additional_space, max_size);
+        // Reallocate TempTxStatusReportAccount
+        reallocate_temp_report_account(
+            &mut ctx.accounts.temp_report_account,
+            &payer,
+            &system_program,
+        )?;
 
-        // Perform reallocation
-        oracle_contract_state
-            .to_account_info()
-            .realloc(new_size, false)?;
+        // Reallocate ContributorDataAccount
+        reallocate_contributor_data_account(
+            &mut ctx.accounts.contributor_data_account,
+            &payer,
+            &system_program,
+        )?;
 
-        msg!("OracleContractState reallocated to new size: {}", new_size);
+        // Reallocate TxidSubmissionCountsAccount
+        reallocate_submission_counts_account(
+            &mut ctx.accounts.txid_submission_counts_account,
+            &payer,
+            &system_program,
+        )?;
 
-        reallocate_temp_report_account(&mut ctx.accounts.temp_report_account)?;
-        reallocate_contributor_data_account(&mut ctx.accounts.contributor_data_account)?;
-        reallocate_submission_counts_account(&mut ctx.accounts.txid_submission_counts_account)?;
+        // Reallocate AggregatedConsensusDataAccount
         reallocate_aggregated_consensus_data_account(
             &mut ctx.accounts.aggregated_consensus_data_account,
+            &payer,
+            &system_program,
         )?;
+
+        msg!("All accounts reallocated and rent-exempt status ensured.");
         Ok(())
     }
 }
@@ -1416,7 +1677,7 @@ impl Contributor {
 
 #[derive(Accounts)]
 pub struct SetBridgeContract<'info> {
-    #[account(mut, has_one = admin_pubkey)]
+    #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
     pub admin_pubkey: Signer<'info>,
 }
@@ -1427,6 +1688,10 @@ impl<'info> SetBridgeContract<'info> {
         bridge_contract_pubkey: Pubkey,
     ) -> Result<()> {
         let state = &mut ctx.accounts.oracle_contract_state;
+        // Explicit admin check
+        if state.admin_pubkey != ctx.accounts.admin_pubkey.key() {
+            return Err(OracleError::UnauthorizedWithdrawalAccount.into());
+        }
         state.bridge_contract_pubkey = bridge_contract_pubkey;
         msg!(
             "Bridge contract pubkey updated: {:?}",
@@ -1479,15 +1744,13 @@ pub fn process_payment_helper(
     Ok(())
 }
 
+
 #[derive(Accounts)]
 pub struct WithdrawFunds<'info> {
-    #[account(
-        mut,
-        constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ OracleError::UnauthorizedWithdrawalAccount,
-    )]
+    #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
-
-    /// CHECK: The admin_account is manually verified in the instruction to ensure it's the correct and authorized account for withdrawal operations. This includes checking if the account matches the admin_pubkey stored in oracle_contract_state.
+    
+    /// CHECK: The admin_account is manually verified in the instruction
     #[account(mut)]
     pub admin_account: Signer<'info>,
 
@@ -1507,9 +1770,11 @@ impl<'info> WithdrawFunds<'info> {
         reward_pool_amount: u64,
         fee_receiving_amount: u64,
     ) -> Result<()> {
-        if ctx.accounts.oracle_contract_state.admin_pubkey == ctx.accounts.admin_account.key() {
-            return Err(OracleError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account matches admin_pubkey stored in oracle_contract_state
+        // Explicit admin check
+        if ctx.accounts.oracle_contract_state.admin_pubkey != ctx.accounts.admin_account.key() {
+            return Err(OracleError::UnauthorizedWithdrawalAccount.into());
         }
+
         let reward_pool_account = &mut ctx.accounts.reward_pool_account;
         let fee_receiving_contract_account = &mut ctx.accounts.fee_receiving_contract_account;
 
@@ -1664,6 +1929,11 @@ pub mod solana_pastel_oracle_program {
         reward_pool_amount: u64,
         fee_receiving_amount: u64,
     ) -> Result<()> {
+        let oracle_state = &ctx.accounts.oracle_contract_state;
+        let admin = &ctx.accounts.admin_account;
+        if oracle_state.admin_pubkey != admin.key() {
+            return Err(OracleError::UnauthorizedWithdrawalAccount.into());
+        }
         WithdrawFunds::execute(ctx, reward_pool_amount, fee_receiving_amount)
     }
 }
