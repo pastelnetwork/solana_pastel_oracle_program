@@ -19,4 +19,3 @@ wallet = "~/.config/solana/id.json"
 [scripts]
 # build = "RUSTUP_TOOLCHAIN=nightly cargo build --release"
 test = "sh scripts/run_tests_with_logs.sh"
-

@@ -88,50 +88,35 @@ const measureComputeUnitsAndStorage = async (txSignature: string) => {
 
 describe("Initialization", () => {
   it("Initializes and expands the oracle contract state", async () => {
-    // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
+    // Find the PDAs for all accounts
     const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("reward_pool")],
       program.programId
     );
-    const [feeReceivingContractAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("fee_receiving_contract")],
-        program.programId
-      );
-
-    // Find the PDA for the ContributorDataAccount
+    const [feeReceivingContractAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_receiving_contract")],
+      program.programId
+    );
     const [contributorDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("contributor_data")],
       program.programId
     );
-
-    // Find the PDA for the TxidSubmissionCountsAccount
-    const [txidSubmissionCountsAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("txid_submission_counts")],
-        program.programId
-      );
-
-    // Find the PDA for the AggregatedConsensusDataAccount
-    const [aggregatedConsensusDataAccountPDA] =
-      web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("aggregated_consensus_data")],
-        program.programId
-      );
-
-    // Find the PDA for the TempTxStatusReportAccount
+    const [txidSubmissionCountsAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("txid_submission_counts")],
+      program.programId
+    );
+    const [aggregatedConsensusDataAccountPDA] = web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("aggregated_consensus_data")],
+      program.programId
+    );
     const [tempReportAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("temp_tx_status_report")],
       program.programId
     );
 
     // Calculate the rent-exempt minimum balance for the account size
-    const minBalanceForRentExemption =
-      await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
-    console.log(
-      "Minimum Balance for Rent Exemption:",
-      minBalanceForRentExemption
-    );
+    const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(100 * 1024);
+    console.log("Minimum Balance for Rent Exemption:", minBalanceForRentExemption);
 
     // Fund the oracleContractState account with enough SOL for rent exemption
     console.log("Funding Oracle Contract State account for rent exemption");
@@ -146,23 +131,20 @@ describe("Initialization", () => {
     const fundTxSignature = await provider.sendAndConfirm(fundTx);
     await measureComputeUnitsAndStorage(fundTxSignature);
 
-    // Initial Initialization
+    // Step 1: Initialize main state
     console.log("Initializing Oracle Contract State");
-    const initTxSignature = await program.methods
+    const initMainTxSignature = await program.methods
       .initialize()
       .accountsStrict({
         oracleContractState: oracleContractState.publicKey,
-        contributorDataAccount: contributorDataAccountPDA,
         user: admin.publicKey,
-        tempReportAccount: tempReportAccountPDA,
-        txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
-        aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
         systemProgram: web3.SystemProgram.programId,
       })
       .signers([oracleContractState])
       .rpc();
-    await measureComputeUnitsAndStorage(initTxSignature);
+    await measureComputeUnitsAndStorage(initMainTxSignature);
 
+    // Verify main state initialization
     let state = await program.account.oracleContractState.fetch(
       oracleContractState.publicKey
     );
@@ -175,6 +157,42 @@ describe("Initialization", () => {
       admin.publicKey.toString(),
       "Admin public key should match after first init"
     );
+
+    // Step 2: Initialize PDAs
+    console.log("Initializing PDA accounts");
+    const initPDAsTxSignature = await program.methods
+      .initializePdas()
+      .accountsStrict({
+        oracleContractState: oracleContractState.publicKey,
+        user: admin.publicKey,
+        tempReportAccount: tempReportAccountPDA,
+        contributorDataAccount: contributorDataAccountPDA,
+        txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
+        aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+        systemProgram: web3.SystemProgram.programId,
+      })
+      .rpc();
+    await measureComputeUnitsAndStorage(initPDAsTxSignature);
+
+    // Verify PDA initialization
+    const tempReportAccount = await program.account.tempTxStatusReportAccount.fetch(
+      tempReportAccountPDA
+    );
+    const contributorDataAccount = await program.account.contributorDataAccount.fetch(
+      contributorDataAccountPDA
+    );
+    const txidSubmissionCountsAccount = await program.account.txidSubmissionCountsAccount.fetch(
+      txidSubmissionCountsAccountPDA
+    );
+    const aggregatedConsensusDataAccount = await program.account.aggregatedConsensusDataAccount.fetch(
+      aggregatedConsensusDataAccountPDA
+    );
+
+    // Verify all PDAs are properly initialized
+    assert.ok(Array.isArray(tempReportAccount.reports), "TempReportAccount reports should be initialized as empty array");
+    assert.ok(Array.isArray(contributorDataAccount.contributors), "ContributorDataAccount contributors should be initialized as empty array");
+    assert.ok(Array.isArray(txidSubmissionCountsAccount.submissionCounts), "TxidSubmissionCountsAccount counts should be initialized as empty array");
+    assert.ok(Array.isArray(aggregatedConsensusDataAccount.consensusData), "AggregatedConsensusDataAccount data should be initialized as empty array");
 
     // Incremental Reallocation
     let currentSize = 10_240; // Initial size after first init
@@ -204,7 +222,6 @@ describe("Initialization", () => {
         oracleContractState.publicKey
       );
 
-      // Log the updated size of the account
       console.log(`Oracle Contract State size after expansion: ${currentSize}`);
     }
 
@@ -214,15 +231,12 @@ describe("Initialization", () => {
       maxSize,
       "Oracle Contract State should reach the maximum size"
     );
-    console.log(
-      "Oracle Contract State expanded to the maximum size successfully"
-    );
+    console.log("Oracle Contract State expanded to the maximum size successfully");
   });
 });
 
 describe("Reinitialization Prevention", () => {
   it("Prevents reinitialization of OracleContractState and all PDAs", async () => {
-    // Find all PDAs required for initialization
     const [rewardPoolAccountPDA] = web3.PublicKey.findProgramAddressSync(
       [Buffer.from("reward_pool")],
       program.programId
@@ -249,60 +263,58 @@ describe("Reinitialization Prevention", () => {
     );
 
     try {
-      // Calculate the rent-exempt minimum balance for the account size
-      const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
-      
-      // Fund the oracleContractState account with enough SOL for rent exemption
-      const fundTx = new anchor.web3.Transaction().add(
-        anchor.web3.SystemProgram.transfer({
-          fromPubkey: admin.publicKey,
-          toPubkey: oracleContractState.publicKey,
-          lamports: minBalanceForRentExemption,
-        })
-      );
-      await provider.sendAndConfirm(fundTx);
-
-      // Attempt to reinitialize all accounts
-      const reinitTxSignature = await program.methods
+      // Try to reinitialize main state
+      const initMainTxSignature = await program.methods
         .initialize()
         .accountsStrict({
           oracleContractState: oracleContractState.publicKey,
-          contributorDataAccount: contributorDataAccountPDA,
           user: admin.publicKey,
-          tempReportAccount: tempReportAccountPDA,
-          txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
-          aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
           systemProgram: web3.SystemProgram.programId,
         })
-        .signers([oracleContractState])
         .rpc();
-
-      await measureComputeUnitsAndStorage(reinitTxSignature);
-      throw new Error("Reinitialization of OracleContractState and PDAs should fail");
+      
+      await measureComputeUnitsAndStorage(initMainTxSignature);
+      assert.fail("Main state reinitialization should have failed");
     } catch (error) {
       if (error instanceof anchor.AnchorError) {
         const anchorError = error as anchor.AnchorError;
         assert.equal(
           anchorError.error.errorCode.code,
           "AccountAlreadyInitialized",
-          "Should throw AccountAlreadyInitialized error"
+          "Should throw AccountAlreadyInitialized error for main state"
         );
-        console.log("Successfully prevented reinitialization with correct error:", anchorError.error.errorMessage);
-      } else if (error.toString().includes("failed to send transaction")) {
-        // Handle case where transaction fails to send due to simulation error
-        console.log("Transaction simulation failed as expected due to initialization prevention");
-      } else if (error.logs && error.logs.some(log => 
-        log.includes("AccountAlreadyInitialized") || 
-        log.includes("already in use")
-      )) {
-        console.log("Successfully prevented reinitialization");
-      } else {
-        console.error("Unexpected error:", error);
-        throw error;
       }
     }
 
-    // Verify that the original initialization state remains unchanged
+    try {
+      // Try to reinitialize PDAs
+      const initPDAsTxSignature = await program.methods
+        .initializePdas()
+        .accountsStrict({
+          oracleContractState: oracleContractState.publicKey,
+          user: admin.publicKey,
+          tempReportAccount: tempReportAccountPDA,
+          contributorDataAccount: contributorDataAccountPDA,
+          txidSubmissionCountsAccount: txidSubmissionCountsAccountPDA,
+          aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .rpc();
+
+      await measureComputeUnitsAndStorage(initPDAsTxSignature);
+      assert.fail("PDA reinitialization should have failed");
+    } catch (error) {
+      if (error instanceof anchor.AnchorError) {
+        const anchorError = error as anchor.AnchorError;
+        assert.equal(
+          anchorError.error.errorCode.code,
+          "AccountAlreadyInitialized",
+          "Should throw AccountAlreadyInitialized error for PDAs"
+        );
+      }
+    }
+
+    // Verify state remains unchanged
     const state = await program.account.oracleContractState.fetch(
       oracleContractState.publicKey
     );
@@ -317,7 +329,6 @@ describe("Reinitialization Prevention", () => {
       "Admin public key should remain unchanged"
     );
 
-    // Log test completion
     console.log("Reinitialization prevention test completed successfully");
   });
 });

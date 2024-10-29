@@ -838,14 +838,24 @@ pub struct OracleContractState {
     pub bridge_contract_pubkey: Pubkey,
 }
 
+// First set of accounts for main state initialization
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 10_240)] // Adjusted space
+    #[account(init, payer = user, space = 10_240)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+// Second set of accounts for PDA initialization
+#[derive(Accounts)]
+pub struct InitializePDAs<'info> {
+    #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
     #[account(mut)]
     pub user: Signer<'info>,
 
-    // Account for TempTxStatusReportAccount PDA
     #[account(
         init,
         seeds = [b"temp_tx_status_report"],
@@ -855,7 +865,6 @@ pub struct Initialize<'info> {
     )]
     pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
 
-    // Account for ContributorDataAccount PDA
     #[account(
         init,
         seeds = [b"contributor_data"],
@@ -865,7 +874,6 @@ pub struct Initialize<'info> {
     )]
     pub contributor_data_account: Account<'info, ContributorDataAccount>,
 
-    // Account for TxidSubmissionCountsAccount PDA
     #[account(
         init,
         seeds = [b"txid_submission_counts"],
@@ -875,7 +883,6 @@ pub struct Initialize<'info> {
     )]
     pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
 
-    // Account for AggregatedConsensusDataAccount PDA
     #[account(
         init,
         seeds = [b"aggregated_consensus_data"],
@@ -885,7 +892,6 @@ pub struct Initialize<'info> {
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
-    // System program is needed for account creation
     pub system_program: Program<'info, System>,
 }
 
@@ -1826,29 +1832,37 @@ pub mod solana_pastel_oracle_program {
 
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         msg!("Initializing Oracle Contract State");
-        ctx.accounts.initialize_oracle_state()?;
-        // msg!("Oracle Contract State Initialized with Admin Pubkey: {:?}", admin_pubkey);
+        let state = &mut ctx.accounts.oracle_contract_state;
+        
+        if state.is_initialized {
+            return Err(OracleError::AccountAlreadyInitialized.into());
+        }
 
-        // Logging for Reward Pool and Fee Receiving Contract Accounts
-        // msg!("Reward Pool Account: {:?}", ctx.accounts.reward_pool_account.key());
-        // msg!("Fee Receiving Contract Account: {:?}", ctx.accounts.fee_receiving_contract_account.key());
-        msg!(
-            "Temp Report Account: {:?}",
-            ctx.accounts.temp_report_account.key()
-        );
-        msg!(
-            "Contributor Data Account: {:?}",
-            ctx.accounts.contributor_data_account.key()
-        );
-        msg!(
-            "Txid Submission Counts Account: {:?}",
-            ctx.accounts.txid_submission_counts_account.key()
-        );
-        msg!(
-            "Aggregated Consensus Data Account: {:?}",
-            ctx.accounts.aggregated_consensus_data_account.key()
-        );
+        state.is_initialized = true;
+        state.admin_pubkey = ctx.accounts.user.key();
+        state.monitored_txids = Vec::new();
+        state.bridge_contract_pubkey = Pubkey::default();
 
+        msg!("Oracle Contract State Initialization Complete");
+        Ok(())
+    }
+
+    pub fn initialize_pdas(ctx: Context<InitializePDAs>) -> Result<()> {
+        // Initialize TempTxStatusReportAccount
+        ctx.accounts.temp_report_account.reports = Vec::new();
+        ctx.accounts.temp_report_account.common_reports = Vec::new();
+        ctx.accounts.temp_report_account.specific_reports = Vec::new();
+
+        // Initialize ContributorDataAccount
+        ctx.accounts.contributor_data_account.contributors = Vec::new();
+
+        // Initialize TxidSubmissionCountsAccount
+        ctx.accounts.txid_submission_counts_account.submission_counts = Vec::new();
+
+        // Initialize AggregatedConsensusDataAccount
+        ctx.accounts.aggregated_consensus_data_account.consensus_data = Vec::new();
+
+        msg!("PDA Accounts Initialization Complete");
         Ok(())
     }
 
